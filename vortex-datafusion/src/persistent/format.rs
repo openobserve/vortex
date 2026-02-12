@@ -415,7 +415,7 @@ impl FileFormat for VortexFormat {
                             )
                             .vortex_expect("`Stat::Min` somehow had an incompatible `DType`")
                             .cast(&DType::from_arrow(field.as_ref()))
-                            .vortex_expect("Unable to cast to target type that DataFusion wants")
+                            .ok()?
                             .try_to_df()
                             .ok()
                         })
@@ -434,7 +434,7 @@ impl FileFormat for VortexFormat {
                             )
                             .vortex_expect("`Stat::Max` somehow had an incompatible `DType`")
                             .cast(&DType::from_arrow(field.as_ref()))
-                            .vortex_expect("Unable to cast to target type that DataFusion wants")
+                            .ok()?
                             .try_to_df()
                             .ok()
                         })
