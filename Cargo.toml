@@ -121,19 +121,21 @@ cudarc = { version = "0.18.2", features = [
 ] }
 custom-labels = "0.4.4"
 dashmap = "6.1.0"
-datafusion = { version = "52", default-features = false, features = ["sql"] }
-datafusion-catalog = { version = "52" }
-datafusion-common = { version = "52" }
-datafusion-common-runtime = { version = "52" }
-datafusion-datasource = { version = "52", default-features = false }
-datafusion-execution = { version = "52" }
-datafusion-expr = { version = "52" }
-datafusion-functions = { version = "52" }
-datafusion-physical-expr = { version = "52" }
-datafusion-physical-expr-adapter = { version = "52" }
-datafusion-physical-expr-common = { version = "52" }
-datafusion-physical-plan = { version = "52" }
-datafusion-pruning = { version = "52" }
+datafusion = { git = "https://github.com/openobserve/datafusion", rev = "a9b568263f6f24ab9bb711893dc23fd7960f94eb", default-features = false, features = [
+    "sql",
+] }
+datafusion-catalog = { git = "https://github.com/openobserve/datafusion", rev = "a9b568263f6f24ab9bb711893dc23fd7960f94eb" }
+datafusion-common = { git = "https://github.com/openobserve/datafusion", rev = "a9b568263f6f24ab9bb711893dc23fd7960f94eb" }
+datafusion-common-runtime = { git = "https://github.com/openobserve/datafusion", rev = "a9b568263f6f24ab9bb711893dc23fd7960f94eb" }
+datafusion-datasource = { git = "https://github.com/openobserve/datafusion", rev = "a9b568263f6f24ab9bb711893dc23fd7960f94eb", default-features = false }
+datafusion-execution = { git = "https://github.com/openobserve/datafusion", rev = "a9b568263f6f24ab9bb711893dc23fd7960f94eb" }
+datafusion-expr = { git = "https://github.com/openobserve/datafusion", rev = "a9b568263f6f24ab9bb711893dc23fd7960f94eb" }
+datafusion-functions = { git = "https://github.com/openobserve/datafusion", rev = "a9b568263f6f24ab9bb711893dc23fd7960f94eb" }
+datafusion-physical-expr = { git = "https://github.com/openobserve/datafusion", rev = "a9b568263f6f24ab9bb711893dc23fd7960f94eb" }
+datafusion-physical-expr-adapter = { git = "https://github.com/openobserve/datafusion", rev = "a9b568263f6f24ab9bb711893dc23fd7960f94eb" }
+datafusion-physical-expr-common = { git = "https://github.com/openobserve/datafusion", rev = "a9b568263f6f24ab9bb711893dc23fd7960f94eb" }
+datafusion-physical-plan = { git = "https://github.com/openobserve/datafusion", rev = "a9b568263f6f24ab9bb711893dc23fd7960f94eb" }
+datafusion-pruning = { git = "https://github.com/openobserve/datafusion", rev = "a9b568263f6f24ab9bb711893dc23fd7960f94eb" }
 dirs = "6.0.0"
 divan = { package = "codspeed-divan-compat", version = "4.0.4" }
 enum-iterator = "2.0.0"
