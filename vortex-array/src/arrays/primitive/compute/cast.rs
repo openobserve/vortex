@@ -15,12 +15,16 @@ use crate::IntoArray;
 use crate::aggregate_fn;
 use crate::arrays::Primitive;
 use crate::arrays::PrimitiveArray;
+use crate::builders::ArrayBuilder;
+use crate::builders::VarBinViewBuilder;
+use crate::canonical::ToCanonical;
 use crate::dtype::DType;
 use crate::dtype::NativePType;
 use crate::dtype::Nullability;
 use crate::dtype::PType;
 use crate::match_each_native_ptype;
 use crate::scalar_fn::fns::cast::CastKernel;
+use crate::validity::Validity;
 use crate::vtable::ValidityHelper;
 
 impl CastKernel for Primitive {
@@ -29,65 +33,68 @@ impl CastKernel for Primitive {
         dtype: &DType,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
-        let DType::Primitive(new_ptype, new_nullability) = dtype else {
-            return Ok(None);
-        };
-        let (new_ptype, new_nullability) = (*new_ptype, *new_nullability);
+        match dtype {
+            DType::Primitive(new_ptype, new_nullability) => {
+                let (new_ptype, new_nullability) = (*new_ptype, *new_nullability);
 
-        // First, check that the cast is compatible with the source array's validity
-        let new_validity = array
-            .validity()
-            .clone()
-            .cast_nullability(new_nullability, array.len())?;
+                // First, check that the cast is compatible with the source array's validity
+                let new_validity = array
+                    .validity()
+                    .clone()
+                    .cast_nullability(new_nullability, array.len())?;
 
-        // Same ptype: zero-copy, just update validity.
-        if array.ptype() == new_ptype {
-            // SAFETY: validity and data buffer still have same length
-            return Ok(Some(unsafe {
-                PrimitiveArray::new_unchecked_from_handle(
-                    array.buffer_handle().clone(),
-                    array.ptype(),
-                    new_validity,
-                )
-                .into_array()
-            }));
-        }
+                // Same ptype: zero-copy, just update validity.
+                if array.ptype() == new_ptype {
+                    // SAFETY: validity and data buffer still have same length
+                    return Ok(Some(unsafe {
+                        PrimitiveArray::new_unchecked_from_handle(
+                            array.buffer_handle().clone(),
+                            array.ptype(),
+                            new_validity,
+                        )
+                        .into_array()
+                    }));
+                }
 
-        // Same-width integers have identical bit representations due to 2's
-        // complement. If all values fit in the target range, reinterpret with
-        // no allocation.
-        if array.ptype().is_int()
-            && new_ptype.is_int()
-            && array.ptype().byte_width() == new_ptype.byte_width()
-        {
-            if !values_fit_in(array, new_ptype, ctx) {
-                vortex_bail!(
-                    Compute: "Cannot cast {} to {} — values exceed target range",
-                    array.ptype(),
-                    new_ptype,
-                );
+                // Same-width integers have identical bit representations due to 2's
+                // complement. If all values fit in the target range, reinterpret with
+                // no allocation.
+                if array.ptype().is_int()
+                    && new_ptype.is_int()
+                    && array.ptype().byte_width() == new_ptype.byte_width()
+                {
+                    if !values_fit_in(array, new_ptype, ctx) {
+                        vortex_bail!(
+                            Compute: "Cannot cast {} to {} — values exceed target range",
+                            array.ptype(),
+                            new_ptype,
+                        );
+                    }
+                    // SAFETY: both types are integers with the same size and alignment, and
+                    // min/max confirm all valid values are representable in the target type.
+                    return Ok(Some(unsafe {
+                        PrimitiveArray::new_unchecked_from_handle(
+                            array.buffer_handle().clone(),
+                            new_ptype,
+                            new_validity,
+                        )
+                        .into_array()
+                    }));
+                }
+
+                let mask = array.validity_mask()?;
+
+                // Otherwise, we need to cast the values one-by-one.
+                Ok(Some(match_each_native_ptype!(new_ptype, |T| {
+                    match_each_native_ptype!(array.ptype(), |F| {
+                        PrimitiveArray::new(cast::<F, T>(array.as_slice(), mask)?, new_validity)
+                            .into_array()
+                    })
+                })))
             }
-            // SAFETY: both types are integers with the same size and alignment, and
-            // min/max confirm all valid values are representable in the target type.
-            return Ok(Some(unsafe {
-                PrimitiveArray::new_unchecked_from_handle(
-                    array.buffer_handle().clone(),
-                    new_ptype,
-                    new_validity,
-                )
-                .into_array()
-            }));
+            DType::Utf8(_) => cast_primitive_to_utf8(array, dtype),
+            _ => Ok(None),
         }
-
-        let mask = array.validity_mask()?;
-
-        // Otherwise, we need to cast the values one-by-one.
-        Ok(Some(match_each_native_ptype!(new_ptype, |T| {
-            match_each_native_ptype!(array.ptype(), |F| {
-                PrimitiveArray::new(cast::<F, T>(array.as_slice(), mask)?, new_validity)
-                    .into_array()
-            })
-        })))
     }
 }
 
@@ -98,6 +105,47 @@ fn values_fit_in(array: &PrimitiveArray, target_ptype: PType, ctx: &mut Executio
         .ok()
         .flatten()
         .is_none_or(|mm| mm.min.cast(&target_dtype).is_ok() && mm.max.cast(&target_dtype).is_ok())
+}
+
+fn cast_primitive_to_utf8(array: &PrimitiveArray, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
+    let mut builder = VarBinViewBuilder::with_capacity(dtype.clone(), array.len());
+
+    match_each_native_ptype!(array.ptype(), |T| {
+        let slice = array.as_slice::<T>();
+        append_primitive_values_to_utf8(&mut builder, slice, array.validity())?
+    });
+
+    Ok(Some(builder.finish().into_array()))
+}
+
+fn append_primitive_values_to_utf8<T: NativePType>(
+    builder: &mut VarBinViewBuilder,
+    slice: &[T],
+    validity: &Validity,
+) -> VortexResult<()> {
+    match validity {
+        Validity::NonNullable | Validity::AllValid => {
+            for value in slice {
+                builder.append_value(value.to_string());
+            }
+        }
+        Validity::AllInvalid => {
+            for _ in 0..slice.len() {
+                builder.append_null();
+            }
+        }
+        Validity::Array(validity_array) => {
+            let validity_bits = validity_array.to_bool().to_bit_buffer();
+            for (value, valid) in slice.iter().zip(validity_bits.iter()) {
+                if valid {
+                    builder.append_value(value.to_string());
+                } else {
+                    builder.append_null();
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn cast<F: NativePType, T: NativePType>(array: &[F], mask: Mask) -> VortexResult<Buffer<T>> {
@@ -333,5 +381,57 @@ mod test {
     #[case(buffer![42u32].into_array())]
     fn test_cast_primitive_conformance(#[case] array: crate::ArrayRef) {
         test_cast_conformance(&array);
+    }
+
+    #[test]
+    fn cast_i64_to_utf8() {
+        use crate::arrays::VarBinViewArray;
+
+        let arr = buffer![100i64, 200, 300, -42].into_array();
+        let result = arr.cast(DType::Utf8(Nullability::NonNullable)).unwrap();
+
+        let expected = VarBinViewArray::from_iter_str(vec!["100", "200", "300", "-42"]);
+        assert_arrays_eq!(result, expected);
+    }
+
+    #[test]
+    fn cast_i64_to_utf8_with_nulls() {
+        use crate::arrays::VarBinViewArray;
+
+        let arr = PrimitiveArray::from_option_iter([Some(100i64), None, Some(300), Some(-42)]);
+        let result = arr
+            .into_array()
+            .cast(DType::Utf8(Nullability::Nullable))
+            .unwrap();
+
+        let expected = VarBinViewArray::from_iter_nullable_str(vec![
+            Some("100"),
+            None,
+            Some("300"),
+            Some("-42"),
+        ]);
+        assert_arrays_eq!(result, expected);
+    }
+
+    #[test]
+    fn cast_u32_to_utf8() {
+        use crate::arrays::VarBinViewArray;
+
+        let arr = buffer![0u32, 10, 200, 1000].into_array();
+        let result = arr.cast(DType::Utf8(Nullability::NonNullable)).unwrap();
+
+        let expected = VarBinViewArray::from_iter_str(vec!["0", "10", "200", "1000"]);
+        assert_arrays_eq!(result, expected);
+    }
+
+    #[test]
+    fn cast_f64_to_utf8() {
+        use crate::arrays::VarBinViewArray;
+
+        let arr = buffer![1.5f64, -2.5, 100.0].into_array();
+        let result = arr.cast(DType::Utf8(Nullability::NonNullable)).unwrap();
+
+        let expected = VarBinViewArray::from_iter_str(vec!["1.5", "-2.5", "100"]);
+        assert_arrays_eq!(result, expected);
     }
 }

@@ -859,6 +859,264 @@ async fn test_external_table_dictionary_columns(
     Ok(())
 }
 
+/// Test schema evolution: Bool column in one file is cast to Int64 in the unified schema.
+/// Booleans are converted as: true → 1, false → 0.
+#[rstest]
+#[tokio::test]
+async fn test_schema_evolution_bool_to_int64(
+    #[values(false, true)] projection_pushdown: bool,
+) -> anyhow::Result<()> {
+    let ctx = TestSessionContext::new(projection_pushdown);
+
+    // file1: "val" as Boolean
+    let bool_array: ArrowArrayRef =
+        create_array!(Boolean, vec![Some(true), Some(false), Some(true)]);
+    ctx.write_arrow_batch(
+        "files/file1.vortex",
+        &RecordBatch::try_from_iter([("val", bool_array)])?,
+    )
+    .await?;
+
+    // file2: "val" as Int64
+    ctx.write_arrow_batch(
+        "files/file2.vortex",
+        &record_batch!(("val", Int64, vec![Some(10i64), Some(20), Some(30)]))?,
+    )
+    .await?;
+
+    let target_schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int64, true)]));
+
+    let provider = ctx.table_provider("tbl", "/files/", target_schema).await?;
+    let table = ctx.session.read_table(provider)?;
+
+    let result = table.clone().collect().await?;
+
+    assert_batches_sorted_eq!(
+        [
+            "+-----+", "| val |", "+-----+", "| 0   |", "| 1   |", "| 1   |", "| 10  |", "| 20  |",
+            "| 30  |", "+-----+",
+        ],
+        &result
+    );
+
+    // Filter on the cast column: val >= 1 spans both the Bool file (true=1) and the Int64 file
+    let filtered = table.filter(col("val").gt_eq(lit(1i64)))?.collect().await?;
+
+    assert_batches_sorted_eq!(
+        [
+            "+-----+", "| val |", "+-----+", "| 1   |", "| 1   |", "| 10  |", "| 20  |", "| 30  |",
+            "+-----+",
+        ],
+        &filtered
+    );
+
+    Ok(())
+}
+
+/// Test schema evolution: Int64 column in one file is cast to Float64 in the unified schema.
+#[rstest]
+#[tokio::test]
+async fn test_schema_evolution_int64_to_float64(
+    #[values(false, true)] projection_pushdown: bool,
+) -> anyhow::Result<()> {
+    let ctx = TestSessionContext::new(projection_pushdown);
+
+    // file1: "val" as Int64
+    ctx.write_arrow_batch(
+        "files/file1.vortex",
+        &record_batch!(("val", Int64, vec![Some(1i64), Some(2), Some(3)]))?,
+    )
+    .await?;
+
+    // file2: "val" as Float64
+    let float_array: ArrowArrayRef = create_array!(Float64, vec![Some(1.5), Some(2.5), Some(3.5)]);
+    ctx.write_arrow_batch(
+        "files/file2.vortex",
+        &RecordBatch::try_from_iter([("val", float_array)])?,
+    )
+    .await?;
+
+    let target_schema = Arc::new(Schema::new(vec![Field::new(
+        "val",
+        DataType::Float64,
+        true,
+    )]));
+
+    let provider = ctx.table_provider("tbl", "/files/", target_schema).await?;
+    let table = ctx.session.read_table(provider)?;
+
+    let result = table.clone().collect().await?;
+
+    assert_batches_sorted_eq!(
+        [
+            "+-----+", "| val |", "+-----+", "| 1.0 |", "| 1.5 |", "| 2.0 |", "| 2.5 |", "| 3.0 |",
+            "| 3.5 |", "+-----+",
+        ],
+        &result
+    );
+
+    // Filter on the cast column: val > 2.0 spans both the Int64 file (3→3.0) and the Float64 file
+    let filtered = table.filter(col("val").gt(lit(2.0f64)))?.collect().await?;
+
+    assert_batches_sorted_eq!(
+        [
+            "+-----+", "| val |", "+-----+", "| 2.5 |", "| 3.0 |", "| 3.5 |", "+-----+",
+        ],
+        &filtered
+    );
+
+    Ok(())
+}
+
+/// Test schema evolution: Float64 column in one file is cast to Utf8 in the unified schema.
+#[rstest]
+#[tokio::test]
+async fn test_schema_evolution_float64_to_utf8(
+    #[values(false, true)] projection_pushdown: bool,
+) -> anyhow::Result<()> {
+    let ctx = TestSessionContext::new(projection_pushdown);
+
+    // file1: "val" as Float64
+    let float_array: ArrowArrayRef = create_array!(Float64, vec![Some(1.5), Some(2.5), Some(3.5)]);
+    ctx.write_arrow_batch(
+        "files/file1.vortex",
+        &RecordBatch::try_from_iter([("val", float_array)])?,
+    )
+    .await?;
+
+    // file2: "val" as Utf8
+    ctx.write_arrow_batch(
+        "files/file2.vortex",
+        &record_batch!(("val", Utf8, vec![Some("hello"), Some("world"), Some("!")]))?,
+    )
+    .await?;
+
+    let target_schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Utf8, true)]));
+
+    let provider = ctx.table_provider("tbl", "/files/", target_schema).await?;
+    let table = ctx.session.read_table(provider)?;
+
+    let result = table.clone().collect().await?;
+
+    assert_batches_sorted_eq!(
+        [
+            "+-------+",
+            "| val   |",
+            "+-------+",
+            "| !     |",
+            "| 1.5   |",
+            "| 2.5   |",
+            "| 3.5   |",
+            "| hello |",
+            "| world |",
+            "+-------+",
+        ],
+        &result
+    );
+
+    // Filter on the cast column: val = 'hello' OR val = '2.5' spans both files
+    let filtered = table
+        .filter(col("val").eq(lit("hello")).or(col("val").eq(lit("2.5"))))?
+        .collect()
+        .await?;
+
+    assert_batches_sorted_eq!(
+        [
+            "+-------+",
+            "| val   |",
+            "+-------+",
+            "| 2.5   |",
+            "| hello |",
+            "+-------+",
+        ],
+        &filtered
+    );
+
+    Ok(())
+}
+
+/// Test schema evolution with the full type widening chain: Bool -> Int64 -> Float64 -> Utf8.
+/// Four files each store data in a different type, and the unified schema uses Utf8
+/// so every file's data must be cast to string.
+#[rstest]
+#[tokio::test]
+async fn test_schema_evolution_type_widening_chain(
+    #[values(false, true)] projection_pushdown: bool,
+) -> anyhow::Result<()> {
+    let ctx = TestSessionContext::new(projection_pushdown);
+
+    // file1: "val" as Boolean
+    let bool_array: ArrowArrayRef = create_array!(Boolean, vec![Some(true), Some(false)]);
+    ctx.write_arrow_batch(
+        "files/file1.vortex",
+        &RecordBatch::try_from_iter([("val", bool_array)])?,
+    )
+    .await?;
+
+    // file2: "val" as Int64
+    ctx.write_arrow_batch(
+        "files/file2.vortex",
+        &record_batch!(("val", Int64, vec![Some(42i64), Some(0)]))?,
+    )
+    .await?;
+
+    // file3: "val" as Float64
+    let float_array: ArrowArrayRef = create_array!(Float64, vec![Some(1.5), Some(2.5)]);
+    ctx.write_arrow_batch(
+        "files/file3.vortex",
+        &RecordBatch::try_from_iter([("val", float_array)])?,
+    )
+    .await?;
+
+    // file4: "val" as Utf8
+    ctx.write_arrow_batch(
+        "files/file4.vortex",
+        &record_batch!(("val", Utf8, vec![Some("hello"), Some("world")]))?,
+    )
+    .await?;
+
+    let target_schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Utf8, true)]));
+
+    let provider = ctx.table_provider("tbl", "/files/", target_schema).await?;
+    let table = ctx.session.read_table(provider)?;
+
+    // Full scan: all values from all files cast to Utf8
+    let result = table.clone().collect().await?;
+
+    assert_batches_sorted_eq!(
+        [
+            "+-------+",
+            "| val   |",
+            "+-------+",
+            "| 0     |",
+            "| 1.5   |",
+            "| 2.5   |",
+            "| 42    |",
+            "| false |",
+            "| hello |",
+            "| true  |",
+            "| world |",
+            "+-------+",
+        ],
+        &result
+    );
+
+    // Filter on the cast column to verify filters work across heterogeneous files
+    let filtered = table
+        .filter(col("val").eq(lit("true")).or(col("val").eq(lit("42"))))?
+        .collect()
+        .await?;
+
+    assert_batches_sorted_eq!(
+        [
+            "+------+", "| val  |", "+------+", "| 42   |", "| true |", "+------+",
+        ],
+        &filtered
+    );
+
+    Ok(())
+}
+
 /// Test using SQL to access struct fields with dictionary types (like polarsignals Q0).
 /// This reproduces the polarsignals benchmark error where `labels.comm` returns
 /// Utf8View instead of Dictionary(UInt32, Utf8).
