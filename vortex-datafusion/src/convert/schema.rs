@@ -78,6 +78,14 @@ fn calculate_physical_field_type(
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
             if dtype.is_binary() || dtype.is_utf8() {
                 logical_type.clone()
+            } else if dtype.is_int() || dtype.is_float() || dtype.is_boolean() {
+                // Return the file's actual type so the expr_adapter can detect
+                // the mismatch and insert casts (same rationale as int/float above).
+                arrow_session
+                    .to_arrow_field("", dtype)
+                    .map_err(|e| exec_datafusion_err!("Failed to convert dtype to arrow: {e}"))?
+                    .data_type()
+                    .clone()
             } else {
                 return Err(exec_datafusion_err!(
                     "Failed to convert dtype to arrow: Vortex DType is {dtype} which is not compatible with {logical_type}"

@@ -181,6 +181,11 @@ impl<'a> PrimitiveScalar<'a> {
                 *decimal_dtype,
                 *nullability,
             )),
+            DType::Utf8(nullability) => {
+                let string =
+                    match_each_native_ptype!(self.ptype, |T| { pvalue.cast::<T>()?.to_string() });
+                Ok(Scalar::utf8(string, *nullability))
+            }
             _ => vortex_bail!("Cannot cast primitive scalar to {dtype}"),
         }
     }

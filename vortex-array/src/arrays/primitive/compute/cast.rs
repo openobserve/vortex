@@ -21,6 +21,8 @@ use crate::array::ArrayView;
 use crate::arrays::Primitive;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::primitive::PrimitiveArrayExt;
+use crate::builders::ArrayBuilder;
+use crate::builders::VarBinViewBuilder;
 use crate::dtype::DType;
 use crate::dtype::NativePType;
 use crate::dtype::Nullability;
@@ -68,10 +70,11 @@ impl CastKernel for Primitive {
         dtype: &DType,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
-        let DType::Primitive(new_ptype, new_nullability) = dtype else {
-            return Ok(None);
+        let (new_ptype, new_nullability) = match dtype {
+            DType::Primitive(new_ptype, new_nullability) => (*new_ptype, *new_nullability),
+            DType::Utf8(_) => return cast_primitive_to_utf8(array, dtype, ctx),
+            _ => return Ok(None),
         };
-        let (new_ptype, new_nullability) = (*new_ptype, *new_nullability);
         let src_ptype = array.ptype();
 
         let new_validity = array
@@ -260,6 +263,51 @@ fn cached_values_fit_in(array: ArrayView<'_, Primitive>, target_dtype: &DType) -
     let min = stats.get(Stat::Min).as_exact()?;
     let max = stats.get(Stat::Max).as_exact()?;
     Some(min.cast(target_dtype).is_ok() && max.cast(target_dtype).is_ok())
+}
+
+/// Render each primitive value to its string representation, producing a Utf8 (VarBinView) array.
+fn cast_primitive_to_utf8(
+    array: ArrayView<'_, Primitive>,
+    dtype: &DType,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<ArrayRef>> {
+    let mut builder = VarBinViewBuilder::with_capacity(dtype.clone(), array.len());
+    let mask = array.validity()?.execute_mask(array.len(), ctx)?;
+
+    match_each_native_ptype!(array.ptype(), |T| {
+        let slice = array.as_slice::<T>();
+        append_primitive_values_to_utf8(&mut builder, slice, &mask);
+    });
+
+    Ok(Some(builder.finish().into_array()))
+}
+
+fn append_primitive_values_to_utf8<T: NativePType>(
+    builder: &mut VarBinViewBuilder,
+    slice: &[T],
+    mask: &Mask,
+) {
+    match mask {
+        Mask::AllTrue(_) => {
+            for value in slice {
+                builder.append_value(value.to_string());
+            }
+        }
+        Mask::AllFalse(_) => {
+            for _ in 0..slice.len() {
+                builder.append_null();
+            }
+        }
+        Mask::Values(values) => {
+            for (value, valid) in slice.iter().zip(values.bit_buffer().iter()) {
+                if valid {
+                    builder.append_value(value.to_string());
+                } else {
+                    builder.append_null();
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -530,5 +578,57 @@ mod test {
     #[case(buffer![42u32].into_array())]
     fn test_cast_primitive_conformance(#[case] array: ArrayRef) {
         test_cast_conformance(&array, &mut array_session().create_execution_ctx());
+    }
+
+    #[test]
+    fn cast_i64_to_utf8() {
+        use crate::arrays::VarBinViewArray;
+
+        let arr = buffer![100i64, 200, 300, -42].into_array();
+        let result = arr.cast(DType::Utf8(Nullability::NonNullable)).unwrap();
+
+        let expected = VarBinViewArray::from_iter_str(vec!["100", "200", "300", "-42"]);
+        assert_arrays_eq!(result, expected);
+    }
+
+    #[test]
+    fn cast_i64_to_utf8_with_nulls() {
+        use crate::arrays::VarBinViewArray;
+
+        let arr = PrimitiveArray::from_option_iter([Some(100i64), None, Some(300), Some(-42)]);
+        let result = arr
+            .into_array()
+            .cast(DType::Utf8(Nullability::Nullable))
+            .unwrap();
+
+        let expected = VarBinViewArray::from_iter_nullable_str(vec![
+            Some("100"),
+            None,
+            Some("300"),
+            Some("-42"),
+        ]);
+        assert_arrays_eq!(result, expected);
+    }
+
+    #[test]
+    fn cast_u32_to_utf8() {
+        use crate::arrays::VarBinViewArray;
+
+        let arr = buffer![0u32, 10, 200, 1000].into_array();
+        let result = arr.cast(DType::Utf8(Nullability::NonNullable)).unwrap();
+
+        let expected = VarBinViewArray::from_iter_str(vec!["0", "10", "200", "1000"]);
+        assert_arrays_eq!(result, expected);
+    }
+
+    #[test]
+    fn cast_f64_to_utf8() {
+        use crate::arrays::VarBinViewArray;
+
+        let arr = buffer![1.5f64, -2.5, 100.0].into_array();
+        let result = arr.cast(DType::Utf8(Nullability::NonNullable)).unwrap();
+
+        let expected = VarBinViewArray::from_iter_str(vec!["1.5", "-2.5", "100"]);
+        assert_arrays_eq!(result, expected);
     }
 }

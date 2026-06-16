@@ -37,7 +37,7 @@ impl TryToDataFusion<ScalarValue> for Scalar {
             DType::Null => ScalarValue::Null,
             DType::Bool(_) => ScalarValue::Boolean(self.as_bool().value()),
             DType::Primitive(ptype, _) => {
-                let pscalar = self.as_primitive();
+                let pscalar = vortex::scalar::PrimitiveScalar::try_from(self)?;
                 match ptype {
                     PType::U8 => ScalarValue::UInt8(pscalar.typed_value::<u8>()),
                     PType::U16 => ScalarValue::UInt16(pscalar.typed_value::<u16>()),
@@ -109,10 +109,14 @@ impl TryToDataFusion<ScalarValue> for Scalar {
                     }
                 }
             }
-            // SAFETY: By construction Utf8 scalar values are utf8
-            DType::Utf8(_) => ScalarValue::Utf8(self.as_utf8().value().cloned().map(|s| unsafe {
-                String::from_utf8_unchecked(Vec::<u8>::from(s.into_inner().into_inner()))
-            })),
+            DType::Utf8(_) => {
+                // Use TryFrom which validates the actual scalar value type matches
+                let utf8_scalar = vortex::scalar::Utf8Scalar::try_from(self)?;
+                ScalarValue::Utf8(utf8_scalar.value().cloned().map(|s| unsafe {
+                    // SAFETY: By construction Utf8 scalar values are utf8
+                    String::from_utf8_unchecked(Vec::<u8>::from(s.into_inner().into_inner()))
+                }))
+            }
             DType::Binary(_) => ScalarValue::Binary(
                 self.as_binary()
                     .value()
