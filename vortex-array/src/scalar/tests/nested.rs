@@ -513,9 +513,9 @@ mod tests {
             Nullability::NonNullable,
         );
 
-        // Try to cast to list of strings - should fail.
+        // Try to cast to list of booleans - should fail (primitive -> bool is unsupported).
         let target = DType::List(
-            Arc::from(DType::Utf8(Nullability::NonNullable)),
+            Arc::from(DType::Bool(Nullability::NonNullable)),
             Nullability::NonNullable,
         );
         assert!(int_list.cast(&target).is_err());
