@@ -37,10 +37,7 @@ pub mod buffer {
 }
 
 pub mod compressor {
-    pub use vortex_btrblocks::BtrBlocksCompressor;
-    pub use vortex_btrblocks::BtrBlocksCompressorBuilder;
-    pub use vortex_btrblocks::Scheme;
-    pub use vortex_btrblocks::SchemeId;
+    pub use vortex_btrblocks::*;
 }
 
 pub mod dtype {

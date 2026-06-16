@@ -164,10 +164,17 @@ impl<'a> PrimitiveScalar<'a> {
 
     /// Casts this scalar to the given `dtype`.
     pub(crate) fn cast(&self, dtype: &DType) -> VortexResult<Scalar> {
-        let ptype = PType::try_from(dtype)?;
         let pvalue = self
             .pvalue
             .vortex_expect("nullness handled in Scalar::cast");
+
+        if let DType::Utf8(_) = dtype {
+            let string =
+                match_each_native_ptype!(self.ptype, |T| { pvalue.cast::<T>()?.to_string() });
+            return Ok(Scalar::utf8(string, dtype.nullability()));
+        }
+
+        let ptype = PType::try_from(dtype)?;
         Ok(match_each_native_ptype!(ptype, |Q| {
             Scalar::primitive(pvalue.cast::<Q>()?, dtype.nullability())
         }))
