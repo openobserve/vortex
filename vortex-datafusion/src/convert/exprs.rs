@@ -417,8 +417,9 @@ fn can_be_pushed_down_impl(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> boo
     } else if let Some(lit) = expr.downcast_ref::<df_expr::Literal>() {
         supported_data_types(&lit.value().data_type())
     } else if let Some(cast_expr) = expr.downcast_ref::<df_expr::CastExpr>() {
-        // CastExpr child must be an expression type that convert() can handle
-        is_convertible_expr(cast_expr.expr())
+        // CastExpr child must be an expression type that convert() can handle,
+        // and every cast in the chain must be one vortex can actually execute.
+        is_convertible_expr(cast_expr.expr()) && is_supported_cast_chain(cast_expr, schema)
     } else if let Some(is_null) = expr.downcast_ref::<df_expr::IsNullExpr>() {
         can_be_pushed_down_impl(is_null.arg(), schema)
     } else if let Some(is_not_null) = expr.downcast_ref::<df_expr::IsNotNullExpr>() {
@@ -490,6 +491,94 @@ fn can_case_be_pushed_down(case_expr: &df_expr::CaseExpr, schema: &Schema) -> bo
     }
 
     true
+}
+
+/// Vortex can execute only a subset of the casts DataFusion's `CastExpr` supports. Walk the
+/// cast chain and verify every source/target pair has a vortex cast kernel; a rejected cast
+/// keeps the predicate in DataFusion's `FilterExec`, which evaluates it with arrow's cast
+/// semantics instead of failing the scan at execution time.
+fn is_supported_cast_chain(cast_expr: &df_expr::CastExpr, schema: &Schema) -> bool {
+    let Ok(src) = cast_expr.expr().data_type(schema) else {
+        return false;
+    };
+    if !is_supported_cast(&src, cast_expr.cast_type()) {
+        tracing::debug!(
+            source = %src,
+            target = %cast_expr.cast_type(),
+            "Cast can't be pushed down: no vortex cast kernel for this type pair"
+        );
+        return false;
+    }
+    match cast_expr.expr().downcast_ref::<df_expr::CastExpr>() {
+        Some(inner) => is_supported_cast_chain(inner, schema),
+        None => true,
+    }
+}
+
+/// Source/target type pairs supported by vortex casts on both the canonical (`CastKernel`)
+/// and constant (`Scalar::cast`) paths. Notably absent: string -> numeric, which arrow
+/// evaluates by parsing the string but vortex has no kernel for.
+///
+/// This must accept every cast a `PhysicalExprAdapter` may insert at file-open time for a
+/// pushed-down predicate (see the opener's re-check), so composite types recurse the same
+/// way vortex's kernels do.
+fn is_supported_cast(src: &DataType, target: &DataType) -> bool {
+    use DataType::*;
+
+    fn is_numeric(dt: &DataType) -> bool {
+        // Decimals are excluded: vortex requires exact decimal matches (see split_projection).
+        dt.is_integer() || dt.is_floating()
+    }
+    fn is_string(dt: &DataType) -> bool {
+        matches!(dt, Utf8 | LargeUtf8 | Utf8View)
+    }
+    fn is_binary(dt: &DataType) -> bool {
+        matches!(dt, Binary | LargeBinary | BinaryView)
+    }
+
+    // The scan canonicalizes dictionary arrays, so only the value type matters.
+    let src = match src {
+        Dictionary(_, value_type) => value_type.as_ref(),
+        other => other,
+    };
+    let target = match target {
+        Dictionary(_, value_type) => value_type.as_ref(),
+        other => other,
+    };
+
+    if src == target {
+        return true;
+    }
+
+    match (src, target) {
+        // Null constants can be cast to any nullable type.
+        (Null, _) => true,
+        // Primitive CastKernel: numeric -> numeric / string. Bool CastKernel: bool ->
+        // numeric / string. The reverse directions (numeric -> bool, string -> numeric)
+        // have no kernel.
+        (s, t) if (is_numeric(s) || *s == Boolean) && (is_numeric(t) || is_string(t)) => true,
+        // VarBinView casts within the string / binary families: the arrow view and
+        // offset-width variants all map to the same vortex dtype.
+        (s, t) if is_string(s) && is_string(t) => true,
+        (s, t) if is_binary(s) && is_binary(t) => true,
+        // struct_cast matches target fields by name, casts them field-wise, and fills
+        // fields missing from the source with nulls when the target field is nullable.
+        (Struct(src_fields), Struct(target_fields)) => target_fields.iter().all(|tf| {
+            match src_fields.iter().find(|sf| sf.name() == tf.name()) {
+                Some(sf) => is_supported_cast(sf.data_type(), tf.data_type()),
+                None => tf.is_nullable(),
+            }
+        }),
+        // ListView CastKernel casts element-wise within the list family.
+        (
+            List(sf) | LargeList(sf) | ListView(sf) | LargeListView(sf),
+            List(tf) | LargeList(tf) | ListView(tf) | LargeListView(tf),
+        ) => is_supported_cast(sf.data_type(), tf.data_type()),
+        (FixedSizeList(sf, s_size), FixedSizeList(tf, t_size)) => {
+            s_size == t_size && is_supported_cast(sf.data_type(), tf.data_type())
+        }
+        _ => false,
+    }
 }
 
 fn supported_data_types(dt: &DataType) -> bool {
@@ -865,6 +954,66 @@ mod tests {
         assert!(!can_be_pushed_down_impl(&like_expr, &test_schema));
     }
 
+    fn cast_of_column(name: &str, index: usize, target: DataType) -> Arc<dyn PhysicalExpr> {
+        Arc::new(df_expr::CastExpr::new(
+            Arc::new(df_expr::Column::new(name, index)),
+            target,
+            None,
+        ))
+    }
+
+    #[rstest]
+    #[case::int_to_int("id", 0, DataType::Int64, true)]
+    #[case::int_to_float("id", 0, DataType::Float64, true)]
+    #[case::int_to_string("id", 0, DataType::Utf8, true)]
+    #[case::float_to_int("score", 2, DataType::Int64, true)]
+    #[case::bool_to_int("active", 3, DataType::Int64, true)]
+    #[case::bool_to_string("active", 3, DataType::Utf8, true)]
+    #[case::string_to_string_view("name", 1, DataType::Utf8View, true)]
+    // No vortex kernel for these; they must stay in DataFusion's FilterExec.
+    #[case::string_to_int("name", 1, DataType::Int64, false)]
+    #[case::string_to_float("name", 1, DataType::Float64, false)]
+    #[case::string_to_bool("name", 1, DataType::Boolean, false)]
+    #[case::int_to_bool("id", 0, DataType::Boolean, false)]
+    #[case::timestamp_to_int("created_at", 4, DataType::Int64, false)]
+    fn test_can_be_pushed_down_cast(
+        test_schema: Schema,
+        #[case] column: &str,
+        #[case] index: usize,
+        #[case] target: DataType,
+        #[case] expected: bool,
+    ) {
+        let expr = cast_of_column(column, index, target);
+        assert_eq!(can_be_pushed_down_impl(&expr, &test_schema), expected);
+    }
+
+    #[rstest]
+    fn test_can_be_pushed_down_nested_cast(test_schema: Schema) {
+        // CAST(CAST(id AS Utf8) AS Utf8View): both hops supported
+        let inner = cast_of_column("id", 0, DataType::Utf8);
+        let expr = Arc::new(df_expr::CastExpr::new(inner, DataType::Utf8View, None))
+            as Arc<dyn PhysicalExpr>;
+        assert!(can_be_pushed_down_impl(&expr, &test_schema));
+
+        // CAST(CAST(name AS Int64) AS Utf8): outer hop is fine but the inner
+        // string -> int hop has no kernel, so the whole chain is rejected.
+        let inner = cast_of_column("name", 1, DataType::Int64);
+        let expr =
+            Arc::new(df_expr::CastExpr::new(inner, DataType::Utf8, None)) as Arc<dyn PhysicalExpr>;
+        assert!(!can_be_pushed_down_impl(&expr, &test_schema));
+    }
+
+    #[rstest]
+    fn test_can_be_pushed_down_binary_with_unsupported_cast(test_schema: Schema) {
+        // CAST(name AS Int64) > 0 — the shape from the original bug report
+        let cast = cast_of_column("name", 1, DataType::Int64);
+        let zero =
+            Arc::new(df_expr::Literal::new(ScalarValue::Int64(Some(0)))) as Arc<dyn PhysicalExpr>;
+        let expr =
+            Arc::new(df_expr::BinaryExpr::new(cast, DFOperator::Gt, zero)) as Arc<dyn PhysicalExpr>;
+        assert!(!can_be_pushed_down_impl(&expr, &test_schema));
+    }
+
     // https://github.com/vortex-data/vortex/issues/6211
     #[tokio::test]
     async fn test_cast_int_to_string() -> anyhow::Result<()> {
@@ -894,6 +1043,89 @@ mod tests {
             .await?
             .collect()
             .await?;
+
+        Ok(())
+    }
+
+    /// Regression test: a numeric comparison against a utf8 column makes DataFusion coerce
+    /// with `CAST(value AS Int64)`. Vortex has no string -> numeric cast, so the predicate
+    /// must stay in DataFusion's FilterExec instead of failing the scan with
+    /// "No CastReduce/CastKernel to cast ... from utf8? to i64?".
+    #[tokio::test]
+    async fn test_string_to_numeric_cast_not_pushed_down() -> anyhow::Result<()> {
+        use datafusion_common::assert_batches_sorted_eq;
+
+        let ctx = TestSessionContext::default();
+
+        // Mixed values exercise the canonical VarBinView path; the single-value file below
+        // exercises the ConstantArray path from the original bug report.
+        ctx.session
+            .sql(r#"copy (values ('1'), ('2'), ('0'), ('-3')) to 'strings.vortex'"#)
+            .await?
+            .collect()
+            .await?;
+        ctx.session
+            .sql(r#"copy (values ('7'), ('7'), ('7')) to 'constant.vortex'"#)
+            .await?
+            .collect()
+            .await?;
+
+        // Implicit coercion: utf8 column compared with a number.
+        let batches = ctx
+            .session
+            .sql(r#"select column1 from 'strings.vortex' where column1 > 0"#)
+            .await?
+            .collect()
+            .await?;
+        assert_batches_sorted_eq!(
+            [
+                "+---------+",
+                "| column1 |",
+                "+---------+",
+                "| 1       |",
+                "| 2       |",
+                "+---------+"
+            ],
+            &batches
+        );
+
+        // Explicit cast form.
+        let batches = ctx
+            .session
+            .sql(r#"select column1 from 'strings.vortex' where cast(column1 as bigint) < 0"#)
+            .await?
+            .collect()
+            .await?;
+        assert_batches_sorted_eq!(
+            [
+                "+---------+",
+                "| column1 |",
+                "+---------+",
+                "| -3      |",
+                "+---------+"
+            ],
+            &batches
+        );
+
+        // Constant-encoded column: the path that produced "No CastReduce" in production.
+        let batches = ctx
+            .session
+            .sql(r#"select column1 from 'constant.vortex' where column1 > 0"#)
+            .await?
+            .collect()
+            .await?;
+        assert_batches_sorted_eq!(
+            [
+                "+---------+",
+                "| column1 |",
+                "+---------+",
+                "| 7       |",
+                "| 7       |",
+                "| 7       |",
+                "+---------+"
+            ],
+            &batches
+        );
 
         Ok(())
     }
