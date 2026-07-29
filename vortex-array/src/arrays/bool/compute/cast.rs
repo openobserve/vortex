@@ -120,6 +120,9 @@ mod tests {
     use crate::IntoArray;
     use crate::VortexSessionExecute;
     use crate::arrays::BoolArray;
+    use crate::arrays::PrimitiveArray;
+    use crate::arrays::VarBinViewArray;
+    use crate::assert_arrays_eq;
     use crate::builtins::ArrayBuiltins;
     use crate::compute::conformance::cast::test_cast_conformance;
     use crate::dtype::DType;
@@ -154,10 +157,7 @@ mod tests {
 
     #[test]
     fn cast_bool_to_i64() {
-        use crate::arrays::PrimitiveArray;
-        use crate::assert_arrays_eq;
-        use crate::dtype::PType;
-
+        let mut ctx = SESSION.create_execution_ctx();
         let bool_array = BoolArray::from_iter(vec![true, false, true, false]);
         let result = bool_array
             .into_array()
@@ -165,15 +165,12 @@ mod tests {
             .unwrap();
 
         let expected = PrimitiveArray::from_iter(vec![1i64, 0, 1, 0]);
-        assert_arrays_eq!(result, expected);
+        assert_arrays_eq!(result, expected, &mut ctx);
     }
 
     #[test]
     fn cast_bool_to_i64_with_nulls() {
-        use crate::arrays::PrimitiveArray;
-        use crate::assert_arrays_eq;
-        use crate::dtype::PType;
-
+        let mut ctx = SESSION.create_execution_ctx();
         let bool_array = BoolArray::from_iter(vec![Some(true), None, Some(false), Some(true)]);
         let result = bool_array
             .into_array()
@@ -181,14 +178,12 @@ mod tests {
             .unwrap();
 
         let expected = PrimitiveArray::from_option_iter(vec![Some(1i64), None, Some(0), Some(1)]);
-        assert_arrays_eq!(result, expected);
+        assert_arrays_eq!(result, expected, &mut ctx);
     }
 
     #[test]
     fn cast_bool_to_utf8() {
-        use crate::arrays::VarBinViewArray;
-        use crate::assert_arrays_eq;
-
+        let mut ctx = SESSION.create_execution_ctx();
         let bool_array = BoolArray::from_iter(vec![true, false, true, false]);
         let result = bool_array
             .into_array()
@@ -196,14 +191,12 @@ mod tests {
             .unwrap();
 
         let expected = VarBinViewArray::from_iter_str(vec!["true", "false", "true", "false"]);
-        assert_arrays_eq!(result, expected);
+        assert_arrays_eq!(result, expected, &mut ctx);
     }
 
     #[test]
     fn cast_bool_to_utf8_with_nulls() {
-        use crate::arrays::VarBinViewArray;
-        use crate::assert_arrays_eq;
-
+        let mut ctx = SESSION.create_execution_ctx();
         let bool_array = BoolArray::from_iter(vec![Some(true), None, Some(false), Some(true)]);
         let result = bool_array
             .into_array()
@@ -216,7 +209,7 @@ mod tests {
             Some("false"),
             Some("true"),
         ]);
-        assert_arrays_eq!(result, expected);
+        assert_arrays_eq!(result, expected, &mut ctx);
     }
 
     #[rstest]

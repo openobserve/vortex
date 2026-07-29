@@ -225,6 +225,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_schema::Fields;
+    use rstest::rstest;
     use vortex::dtype::Nullability;
     use vortex::dtype::PType;
     use vortex::dtype::StructFields;
@@ -315,12 +316,17 @@ mod tests {
 
     #[test]
     fn test_failing_conversion_incompatible_types() {
+        // A numeric/bool file column under a Utf8 logical type is a supported evolution
+        // (the expr adapter inserts the cast), so use a dtype with no cast to Utf8 at all.
         let logical_schema = Schema::new(vec![Field::new("col", DataType::Utf8, false)]);
 
         let dtype = DType::Struct(
             StructFields::from_iter([(
                 "col",
-                DType::Primitive(PType::I32, Nullability::NonNullable),
+                DType::List(
+                    Arc::new(DType::Primitive(PType::I32, Nullability::NonNullable)),
+                    Nullability::NonNullable,
+                ),
             )]),
             Nullability::NonNullable,
         );
@@ -352,6 +358,33 @@ mod tests {
                 .to_string()
                 .contains("not compatible with")
         );
+    }
+
+    #[rstest]
+    #[case::int(
+        DType::Primitive(PType::I32, Nullability::NonNullable),
+        DataType::Int32
+    )]
+    #[case::float(
+        DType::Primitive(PType::F64, Nullability::NonNullable),
+        DataType::Float64
+    )]
+    #[case::bool(DType::Bool(Nullability::NonNullable), DataType::Boolean)]
+    fn test_numeric_file_column_under_utf8_logical_type(
+        #[case] dtype: DType,
+        #[case] expected: DataType,
+    ) {
+        // The physical schema keeps the file's own type so the expr adapter can see the
+        // mismatch and insert the cast, rather than erroring out here.
+        let logical_schema = Schema::new(vec![Field::new("col", DataType::Utf8, false)]);
+        let dtype = DType::Struct(
+            StructFields::from_iter([("col", dtype)]),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &ArrowSession::default()).unwrap();
+        assert_eq!(physical_schema.field(0).data_type(), &expected);
     }
 
     #[test]

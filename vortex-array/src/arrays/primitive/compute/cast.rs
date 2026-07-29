@@ -323,6 +323,7 @@ mod test {
     use crate::VortexSessionExecute;
     use crate::array_session;
     use crate::arrays::PrimitiveArray;
+    use crate::arrays::VarBinViewArray;
     use crate::assert_arrays_eq;
     use crate::builtins::ArrayBuiltins;
     use crate::compute::conformance::cast::test_cast_conformance;
@@ -582,19 +583,17 @@ mod test {
 
     #[test]
     fn cast_i64_to_utf8() {
-        use crate::arrays::VarBinViewArray;
-
+        let mut ctx = array_session().create_execution_ctx();
         let arr = buffer![100i64, 200, 300, -42].into_array();
         let result = arr.cast(DType::Utf8(Nullability::NonNullable)).unwrap();
 
         let expected = VarBinViewArray::from_iter_str(vec!["100", "200", "300", "-42"]);
-        assert_arrays_eq!(result, expected);
+        assert_arrays_eq!(result, expected, &mut ctx);
     }
 
     #[test]
     fn cast_i64_to_utf8_with_nulls() {
-        use crate::arrays::VarBinViewArray;
-
+        let mut ctx = array_session().create_execution_ctx();
         let arr = PrimitiveArray::from_option_iter([Some(100i64), None, Some(300), Some(-42)]);
         let result = arr
             .into_array()
@@ -607,28 +606,26 @@ mod test {
             Some("300"),
             Some("-42"),
         ]);
-        assert_arrays_eq!(result, expected);
+        assert_arrays_eq!(result, expected, &mut ctx);
     }
 
     #[test]
     fn cast_u32_to_utf8() {
-        use crate::arrays::VarBinViewArray;
-
+        let mut ctx = array_session().create_execution_ctx();
         let arr = buffer![0u32, 10, 200, 1000].into_array();
         let result = arr.cast(DType::Utf8(Nullability::NonNullable)).unwrap();
 
         let expected = VarBinViewArray::from_iter_str(vec!["0", "10", "200", "1000"]);
-        assert_arrays_eq!(result, expected);
+        assert_arrays_eq!(result, expected, &mut ctx);
     }
 
     #[test]
     fn cast_f64_to_utf8() {
-        use crate::arrays::VarBinViewArray;
-
+        let mut ctx = array_session().create_execution_ctx();
         let arr = buffer![1.5f64, -2.5, 100.0].into_array();
         let result = arr.cast(DType::Utf8(Nullability::NonNullable)).unwrap();
 
         let expected = VarBinViewArray::from_iter_str(vec!["1.5", "-2.5", "100"]);
-        assert_arrays_eq!(result, expected);
+        assert_arrays_eq!(result, expected, &mut ctx);
     }
 }
