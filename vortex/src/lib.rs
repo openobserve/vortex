@@ -143,7 +143,10 @@ pub mod buffer {
 
 /// Default adaptive compression APIs based on the maintained BtrBlocks-style compressor.
 pub mod compressor {
-    pub use vortex_btrblocks::*;
+    pub use vortex_btrblocks::BtrBlocksCompressor;
+    pub use vortex_btrblocks::BtrBlocksCompressorBuilder;
+    pub use vortex_btrblocks::Scheme;
+    pub use vortex_btrblocks::SchemeId;
 }
 
 /// Vortex editions: versioned sets of serialized components.
