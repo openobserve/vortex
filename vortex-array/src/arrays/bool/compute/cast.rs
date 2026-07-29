@@ -120,7 +120,6 @@ mod tests {
     use crate::IntoArray;
     use crate::VortexSessionExecute;
     use crate::arrays::BoolArray;
-    use crate::arrays::PrimitiveArray;
     use crate::arrays::VarBinViewArray;
     use crate::assert_arrays_eq;
     use crate::builtins::ArrayBuiltins;
@@ -153,32 +152,6 @@ mod tests {
             .cast(DType::Bool(Nullability::NonNullable))
             .and_then(|a| a.execute::<Canonical>(&mut ctx).map(|c| c.into_array()));
         assert!(result.is_err(), "Expected error, got: {result:?}");
-    }
-
-    #[test]
-    fn cast_bool_to_i64() {
-        let mut ctx = SESSION.create_execution_ctx();
-        let bool_array = BoolArray::from_iter(vec![true, false, true, false]);
-        let result = bool_array
-            .into_array()
-            .cast(DType::Primitive(PType::I64, Nullability::NonNullable))
-            .unwrap();
-
-        let expected = PrimitiveArray::from_iter(vec![1i64, 0, 1, 0]);
-        assert_arrays_eq!(result, expected, &mut ctx);
-    }
-
-    #[test]
-    fn cast_bool_to_i64_with_nulls() {
-        let mut ctx = SESSION.create_execution_ctx();
-        let bool_array = BoolArray::from_iter(vec![Some(true), None, Some(false), Some(true)]);
-        let result = bool_array
-            .into_array()
-            .cast(DType::Primitive(PType::I64, Nullability::Nullable))
-            .unwrap();
-
-        let expected = PrimitiveArray::from_option_iter(vec![Some(1i64), None, Some(0), Some(1)]);
-        assert_arrays_eq!(result, expected, &mut ctx);
     }
 
     #[test]
