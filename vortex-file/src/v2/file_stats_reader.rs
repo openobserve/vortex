@@ -17,6 +17,7 @@ use vortex_array::dtype::StructFields;
 use vortex_array::expr::BoundExpression;
 use vortex_array::expr::ExactBoundExpr;
 use vortex_array::expr::Expression;
+use vortex_array::scalar_fn::fns::dynamic::DynamicExprUpdates;
 use vortex_error::VortexResult;
 use vortex_layout::ArrayFuture;
 use vortex_layout::LayoutReader;
@@ -118,6 +119,18 @@ impl LayoutReader for FileStatsLayoutReader {
         expr: &BoundExpression,
         mask: Mask,
     ) -> VortexResult<MaskFuture> {
+        let expression = expr.unbind();
+
+        // Dynamic expressions keep stable identity while their values change, so a result cached
+        // by expression would become stale as soon as the bound is updated.
+        if DynamicExprUpdates::new(&expression).is_some() {
+            return if self.evaluate_file_stats(&expression)? {
+                Ok(MaskFuture::ready(Mask::new_false(mask.len())))
+            } else {
+                self.child.pruning_evaluation(row_range, expr, mask)
+            };
+        }
+
         let key = ExactBoundExpr(expr.clone());
 
         // Check cache first with read-only lock.
@@ -129,7 +142,6 @@ impl LayoutReader for FileStatsLayoutReader {
         }
 
         // Evaluate and cache.
-        let expression = expr.unbind();
         let pruned = self.evaluate_file_stats(&expression)?;
         self.prune_cache.insert(key, pruned);
 
@@ -167,6 +179,8 @@ impl LayoutReader for FileStatsLayoutReader {
 mod tests {
     use std::sync::Arc;
     use std::sync::LazyLock;
+    use std::sync::atomic::AtomicI32;
+    use std::sync::atomic::Ordering;
 
     use vortex_array::ArrayContext;
     use vortex_array::IntoArray as _;
@@ -177,6 +191,7 @@ mod tests {
     use vortex_array::dtype::Nullability;
     use vortex_array::dtype::PType;
     use vortex_array::expr::checked_add;
+    use vortex_array::expr::dynamic;
     use vortex_array::expr::get_item;
     use vortex_array::expr::gt;
     use vortex_array::expr::is_not_null;
@@ -187,6 +202,7 @@ mod tests {
     use vortex_array::expr::stats::Stat;
     use vortex_array::extension::datetime::TimeUnit;
     use vortex_array::scalar::ScalarValue;
+    use vortex_array::scalar_fn::fns::operators::CompareOperator;
     use vortex_array::stats::StatsSet;
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
@@ -309,6 +325,58 @@ mod tests {
             let result = reader.pruning_evaluation(&(0..5), &expr, mask)?.await?;
             // Should delegate to child, which returns the mask unchanged (struct reader doesn't prune).
             assert_eq!(result, Mask::new_true(5));
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn dynamic_filter_updates_bypass_pruning_cache() -> VortexResult<()> {
+        block_on(|handle| async {
+            let session = SESSION.clone().with_handle(handle);
+            let ctx = ArrayContext::empty();
+            let segments = Arc::new(TestSegments::default());
+            let (ptr, eof) = SequenceId::root().split();
+            let struct_array = StructArray::from_fields(
+                [("col", buffer![1i32, 2, 3, 4, 5].into_array())].as_slice(),
+            )?;
+            let strategy = TableStrategy::new(
+                Arc::new(FlatLayoutStrategy::default()),
+                Arc::new(FlatLayoutStrategy::default()),
+            );
+            let layout = strategy
+                .write_stream(
+                    ctx.into(),
+                    Arc::<TestSegments>::clone(&segments),
+                    struct_array.into_array().to_array_stream().sequenced(ptr),
+                    eof,
+                    &session,
+                )
+                .await?;
+
+            let child = layout.new_reader("".into(), segments, &SESSION, &Default::default())?;
+            let reader =
+                FileStatsLayoutReader::new(child, test_file_stats(0, 100), SESSION.clone());
+            let threshold = Arc::new(AtomicI32::new(50));
+            let dynamic_threshold = Arc::clone(&threshold);
+            let expr = dynamic(
+                CompareOperator::Gt,
+                move || Some(dynamic_threshold.load(Ordering::Relaxed).into()),
+                DType::Primitive(PType::I32, Nullability::NonNullable),
+                true,
+                get_item("col", root()),
+            );
+
+            let first = reader
+                .pruning_evaluation(&(0..5), &expr, Mask::new_true(5))?
+                .await?;
+            assert_eq!(first, Mask::new_true(5));
+
+            threshold.store(200, Ordering::Relaxed);
+            let second = reader
+                .pruning_evaluation(&(0..5), &expr, Mask::new_true(5))?
+                .await?;
+            assert_eq!(second, Mask::new_false(5));
 
             Ok(())
         })

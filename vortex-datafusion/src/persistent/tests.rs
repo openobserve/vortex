@@ -149,6 +149,41 @@ async fn test_query_file(#[values(Some(1), None)] limit: Option<usize>) -> anyho
 }
 
 #[tokio::test]
+async fn topk_dynamic_filter_is_retained_by_vortex_scan() -> anyhow::Result<()> {
+    use arrow_schema::Field;
+    use arrow_schema::Schema;
+
+    let ctx = TestSessionContext::default();
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int32Array::from(vec![5, 1, 4, 2, 3]))],
+    )?;
+    ctx.write_arrow_batch("topk-dynamic.vortex", &batch).await?;
+
+    let df = ctx
+        .session
+        .sql("SELECT value FROM '/topk-dynamic.vortex' ORDER BY value ASC LIMIT 2")
+        .await?;
+    let physical_plan = ctx
+        .session
+        .state()
+        .create_physical_plan(df.logical_plan())
+        .await?;
+    let plan = DisplayableExecutionPlan::new(physical_plan.as_ref())
+        .tree_render()
+        .to_string();
+
+    assert!(plan.contains("DynamicFilter"), "{plan}");
+    assert_eq!(batch_values(&df.collect().await?), vec![1, 2]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_addition_pushdown() -> anyhow::Result<()> {
     let ctx = TestSessionContext::default();
 

@@ -617,25 +617,21 @@ impl DataSource for VortexDataSource {
             })
             .collect();
 
-        // If nothing can be pushed down, return early.
-        if pushdown_results.iter().all(|p| matches!(p, PushedDown::No)) {
+        let evaluable = filters
+            .iter()
+            .filter(|expr| convertor.can_be_evaluated_best_effort(expr, input_schema))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        // If nothing can be evaluated by Vortex, return early.
+        if evaluable.is_empty() {
             return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
                 pushdown_results,
             ));
         }
 
-        // Collect the pushable filter expressions.
-        let pushable: Vec<Arc<dyn PhysicalExpr>> = filters
-            .iter()
-            .zip(pushdown_results.iter())
-            .filter_map(|(expr, pushed)| match pushed {
-                PushedDown::Yes => Some(Arc::clone(expr)),
-                PushedDown::No => None,
-            })
-            .collect();
-
         // Convert to Vortex conjunction.
-        let vortex_pred = make_vortex_predicate(&convertor, &pushable)?;
+        let vortex_pred = make_vortex_predicate(&convertor, &evaluable, input_schema)?;
 
         // Combine with existing filter.
         let new_filter = match (&self.filter, vortex_pred) {

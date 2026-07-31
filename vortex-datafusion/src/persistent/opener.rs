@@ -29,6 +29,7 @@ use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr_adapter::replace_columns_with_literals;
+use datafusion_physical_expr_common::physical_expr::is_dynamic_physical_expr;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_physical_plan::metrics::MetricBuilder;
 use datafusion_physical_plan::metrics::MetricCategory;
@@ -363,13 +364,20 @@ impl FileOpener for VortexOpener {
                     // This will only fail if the user has not configured a suitable
                     // PhysicalExprAdapterFactory on the file source to handle rewriting the
                     // expression to handle missing/reordered columns in the Vortex file.
-                    let (pushed, unpushed): (Vec<PhysicalExprRef>, Vec<PhysicalExprRef>) =
-                        split_conjunction(&f)
-                            .into_iter()
-                            .cloned()
-                            .partition(|expr| {
-                                expr_convertor.can_be_pushed_down(expr, &this_file_schema)
-                            });
+                    let mut pushed = Vec::new();
+                    let mut unpushed = Vec::new();
+                    for expr in split_conjunction(&f).into_iter().cloned() {
+                        if expr_convertor.can_be_evaluated_best_effort(&expr, &this_file_schema) {
+                            pushed.push(expr);
+                        } else if is_dynamic_physical_expr(&expr) {
+                            tracing::debug!(
+                                %expr,
+                                "Skipping dynamic filter that is not supported by this file schema"
+                            );
+                        } else {
+                            unpushed.push(expr);
+                        }
+                    }
 
                     if !unpushed.is_empty() {
                         return Some(Err(exec_datafusion_err!(
@@ -385,7 +393,8 @@ impl FileOpener for VortexOpener {
                         )));
                     }
 
-                    make_vortex_predicate(expr_convertor.as_ref(), &pushed).transpose()
+                    make_vortex_predicate(expr_convertor.as_ref(), &pushed, &this_file_schema)
+                        .transpose()
                 })
                 .transpose()?;
 

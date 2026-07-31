@@ -485,27 +485,25 @@ impl FileSource for VortexSource {
             })
             .collect::<Vec<_>>();
 
-        if supported_filters
+        let scan_filters = supported_filters
             .iter()
-            .all(|p| matches!(p.discriminant, PushedDown::No))
-        {
+            .filter(|p| {
+                self.expression_convertor
+                    .can_be_evaluated_best_effort(&p.predicate, self.table_schema.file_schema())
+            })
+            .map(|p| Arc::clone(&p.predicate))
+            .collect::<Vec<_>>();
+
+        if scan_filters.is_empty() {
             return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
                 vec![PushedDown::No; supported_filters.len()],
             )
             .with_updated_node(Arc::new(source) as _));
         }
 
-        let supported = supported_filters
-            .iter()
-            .filter_map(|p| match p.discriminant {
-                PushedDown::Yes => Some(&p.predicate),
-                PushedDown::No => None,
-            })
-            .cloned();
-
         let predicate = match source.vortex_predicate {
-            Some(predicate) => conjunction(std::iter::once(predicate).chain(supported)),
-            None => conjunction(supported),
+            Some(predicate) => conjunction(std::iter::once(predicate).chain(scan_filters)),
+            None => conjunction(scan_filters),
         };
 
         tracing::debug!(%predicate, "Saving predicate");
@@ -551,6 +549,7 @@ mod tests {
     use datafusion_physical_expr::ScalarFunctionExpr;
     use datafusion_physical_expr::expressions as df_expr;
     use datafusion_physical_expr::expressions::Column;
+    use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
     use object_store::memory::InMemory;
     use vortex::VortexSessionDefault;
 
@@ -566,8 +565,20 @@ mod tests {
             self.inner.can_be_pushed_down(expr, schema)
         }
 
+        fn can_be_evaluated_best_effort(&self, expr: &PhysicalExprRef, schema: &Schema) -> bool {
+            self.inner.can_be_evaluated_best_effort(expr, schema)
+        }
+
         fn convert(&self, expr: &dyn PhysicalExpr) -> DFResult<vortex::expr::Expression> {
             self.inner.convert(expr)
+        }
+
+        fn convert_predicate(
+            &self,
+            expr: &PhysicalExprRef,
+            schema: &Schema,
+        ) -> DFResult<vortex::expr::Expression> {
+            self.inner.convert_predicate(expr, schema)
         }
 
         fn split_projection(
@@ -700,6 +711,34 @@ mod tests {
             .downcast_ref::<VortexSource>()
             .ok_or_else(|| anyhow::anyhow!("expected VortexSource"))?
             .clone();
+        assert!(updated_source.vortex_predicate.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn try_pushdown_filters_retains_topk_dynamic_filter_best_effort() -> anyhow::Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let source = sort_test_source(Arc::clone(&schema));
+        let child = Arc::new(Column::new("value", 0)) as PhysicalExprRef;
+        let filter = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![child],
+            df_expr::lit(ScalarValue::Boolean(Some(true))),
+        )) as PhysicalExprRef;
+
+        let result = source.try_pushdown_filters(vec![filter], &ConfigOptions::new())?;
+
+        assert!(matches!(result.filters.as_slice(), [PushedDown::No]));
+        let updated_source = result
+            .updated_node
+            .ok_or_else(|| anyhow::anyhow!("expected updated VortexSource"))?
+            .downcast_ref::<VortexSource>()
+            .ok_or_else(|| anyhow::anyhow!("expected VortexSource"))?
+            .clone();
+        assert!(updated_source.full_predicate.is_some());
         assert!(updated_source.vortex_predicate.is_some());
         Ok(())
     }

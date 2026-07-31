@@ -49,6 +49,8 @@ use vortex::session::VortexSession;
 use vortex_arrow::ArrowSessionExt;
 
 use crate::convert::FromDataFusion;
+use crate::convert::dynamic::convert_topk_dynamic_filter;
+use crate::convert::dynamic::topk_dynamic_child;
 
 /// Result of splitting a projection into Vortex expressions and leftover DataFusion projections.
 pub struct ProcessedProjection {
@@ -62,10 +64,11 @@ pub struct ProcessedProjection {
 pub(crate) fn make_vortex_predicate(
     expr_convertor: &dyn ExpressionConvertor,
     predicate: &[Arc<dyn PhysicalExpr>],
+    schema: &Schema,
 ) -> DFResult<Option<Expression>> {
     let exprs = predicate
         .iter()
-        .map(|e| expr_convertor.convert(e.as_ref()))
+        .map(|e| expr_convertor.convert_predicate(e, schema))
         .collect::<DFResult<Vec<_>>>()?;
 
     Ok(and_collect(exprs))
@@ -117,8 +120,23 @@ pub trait ExpressionConvertor: Send + Sync {
     /// Can an expression be pushed down given a specific schema
     fn can_be_pushed_down(&self, expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool;
 
+    /// Returns whether Vortex can evaluate an expression as a best-effort optimization while
+    /// DataFusion retains the original expression for exact evaluation.
+    fn can_be_evaluated_best_effort(&self, expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+        self.can_be_pushed_down(expr, schema)
+    }
+
     /// Try and convert a DataFusion [`PhysicalExpr`] into a Vortex [`Expression`].
     fn convert(&self, expr: &dyn PhysicalExpr) -> DFResult<Expression>;
+
+    /// Converts a predicate that may use best-effort evaluation.
+    fn convert_predicate(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+        _schema: &Schema,
+    ) -> DFResult<Expression> {
+        self.convert(expr.as_ref())
+    }
 
     /// Split a projection into Vortex expressions that can be pushed down and leftover
     /// DataFusion projections that need to be evaluated after the scan.
@@ -319,6 +337,15 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
         can_be_pushed_down_impl(expr, schema)
     }
 
+    fn can_be_evaluated_best_effort(&self, expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+        if can_be_pushed_down_impl(expr, schema) {
+            return true;
+        }
+
+        topk_dynamic_child(expr, schema)
+            .is_some_and(|child| can_be_pushed_down_impl(&child, schema))
+    }
+
     fn convert(&self, df: &dyn PhysicalExpr) -> DFResult<Expression> {
         // TODO(joe): Don't return an error when we have an unsupported node, bubble up "TRUE" as in keep
         //  for that node, up to any `and` or `or` node.
@@ -406,6 +433,34 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
         Err(exec_datafusion_err!(
             "Couldn't convert DataFusion physical {df} expression to a vortex expression"
         ))
+    }
+
+    fn convert_predicate(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+        schema: &Schema,
+    ) -> DFResult<Expression> {
+        let Some(child) = topk_dynamic_child(expr, schema) else {
+            return self.convert(expr.as_ref());
+        };
+
+        if !can_be_pushed_down_impl(&child, schema) {
+            return Err(exec_datafusion_err!(
+                "Unsupported child in DataFusion Top-K dynamic filter: {child}"
+            ));
+        }
+
+        let lhs = self.convert(child.as_ref())?;
+        let child_field = child.return_field(schema)?;
+        let rhs_dtype = self
+            .session
+            .arrow()
+            .from_arrow_field(child_field.as_ref())
+            .map_err(|e| {
+                exec_datafusion_err!("Failed to convert dynamic filter type to dtype: {e}")
+            })?;
+
+        convert_topk_dynamic_filter(expr, child, lhs, rhs_dtype)
     }
 
     fn split_projection(
@@ -791,7 +846,7 @@ mod tests {
     #[test]
     fn test_make_vortex_predicate_empty() {
         let expr_convertor = DefaultExpressionConvertor::default();
-        let result = make_vortex_predicate(&expr_convertor, &[]).unwrap();
+        let result = make_vortex_predicate(&expr_convertor, &[], &Schema::empty()).unwrap();
         assert!(result.is_none());
     }
 
@@ -799,7 +854,7 @@ mod tests {
     fn test_make_vortex_predicate_single() {
         let expr_convertor = DefaultExpressionConvertor::default();
         let col_expr = Arc::new(df_expr::Column::new("test", 0)) as Arc<dyn PhysicalExpr>;
-        let result = make_vortex_predicate(&expr_convertor, &[col_expr]).unwrap();
+        let result = make_vortex_predicate(&expr_convertor, &[col_expr], &Schema::empty()).unwrap();
         assert!(result.is_some());
     }
 
@@ -808,9 +863,107 @@ mod tests {
         let expr_convertor = DefaultExpressionConvertor::default();
         let col1 = Arc::new(df_expr::Column::new("col1", 0)) as Arc<dyn PhysicalExpr>;
         let col2 = Arc::new(df_expr::Column::new("col2", 1)) as Arc<dyn PhysicalExpr>;
-        let result = make_vortex_predicate(&expr_convertor, &[col1, col2]).unwrap();
+        let result =
+            make_vortex_predicate(&expr_convertor, &[col1, col2], &Schema::empty()).unwrap();
         assert!(result.is_some());
         // Result should be an AND expression combining the two columns
+    }
+
+    #[test]
+    fn topk_dynamic_filter_tracks_threshold_updates() -> anyhow::Result<()> {
+        use datafusion::arrow::array::Int32Array;
+        use datafusion::arrow::array::RecordBatch;
+        use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
+        use vortex::VortexSessionDefault;
+        use vortex::array::ArrayRef;
+        use vortex::array::Canonical;
+        use vortex::array::VortexSessionExecute as _;
+        use vortex::array::arrays::BoolArray;
+        use vortex::array::arrays::bool::BoolArrayExt;
+        use vortex::session::VortexSession;
+        use vortex_arrow::FromArrowArray;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let child = Arc::new(df_expr::Column::new("value", 0)) as Arc<dyn PhysicalExpr>;
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&child)],
+            df_expr::lit(ScalarValue::Boolean(Some(true))),
+        ));
+        let predicate = Arc::clone(&dynamic) as Arc<dyn PhysicalExpr>;
+        let convertor = DefaultExpressionConvertor::default();
+
+        assert!(!convertor.can_be_pushed_down(&predicate, &schema));
+        assert!(convertor.can_be_evaluated_best_effort(&predicate, &schema));
+
+        let vortex_predicate = convertor.convert_predicate(&predicate, &schema)?;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4]))],
+        )?;
+        let input = ArrayRef::from_arrow(&batch, false)?;
+        let mut ctx = VortexSession::default().create_execution_ctx();
+
+        assert_eq!(
+            input
+                .clone()
+                .apply(&vortex_predicate)?
+                .execute::<Canonical>(&mut ctx)?
+                .into_bool()
+                .to_bit_buffer(),
+            BoolArray::from_iter([true, true, true, true]).to_bit_buffer()
+        );
+
+        dynamic.update(Arc::new(df_expr::BinaryExpr::new(
+            Arc::clone(&child),
+            DFOperator::Lt,
+            df_expr::lit(ScalarValue::Int32(Some(3))),
+        )))?;
+        assert_eq!(
+            input
+                .clone()
+                .apply(&vortex_predicate)?
+                .execute::<Canonical>(&mut ctx)?
+                .into_bool()
+                .to_bit_buffer(),
+            BoolArray::from_iter([true, true, false, false]).to_bit_buffer()
+        );
+
+        dynamic.update(Arc::new(df_expr::BinaryExpr::new(
+            child,
+            DFOperator::Gt,
+            df_expr::lit(ScalarValue::Int32(Some(2))),
+        )))?;
+        assert_eq!(
+            input
+                .apply(&vortex_predicate)?
+                .execute::<Canonical>(&mut ctx)?
+                .into_bool()
+                .to_bit_buffer(),
+            BoolArray::from_iter([false, false, true, true]).to_bit_buffer()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn nullable_topk_dynamic_filter_is_not_evaluated_best_effort() {
+        use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
+
+        let schema = Schema::new(vec![Field::new("value", DataType::Int32, true)]);
+        let child = Arc::new(df_expr::Column::new("value", 0)) as Arc<dyn PhysicalExpr>;
+        let predicate = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![child],
+            df_expr::lit(ScalarValue::Boolean(Some(true))),
+        )) as Arc<dyn PhysicalExpr>;
+
+        assert!(
+            !DefaultExpressionConvertor::default()
+                .can_be_evaluated_best_effort(&predicate, &schema)
+        );
     }
 
     #[rstest]

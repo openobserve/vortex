@@ -11,6 +11,7 @@
 
 use vortex::error::VortexResult;
 
+mod dynamic;
 pub(crate) mod exprs;
 mod scalars;
 pub(crate) mod schema;
