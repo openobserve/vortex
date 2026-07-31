@@ -3,7 +3,6 @@
 
 use std::sync::Arc;
 
-use arrow_schema::Schema;
 use datafusion_common::Result as DFResult;
 use datafusion_common::exec_datafusion_err;
 use datafusion_expr::Operator as DFOperator;
@@ -21,20 +20,19 @@ use vortex::scalar_fn::fns::operators::CompareOperator;
 
 use crate::convert::FromDataFusion;
 
-/// Returns the single non-null child used by a Top-K dynamic filter.
-pub(super) fn topk_dynamic_child(
-    expr: &PhysicalExprRef,
-    schema: &Schema,
-) -> Option<PhysicalExprRef> {
+/// Returns the single child used by a Top-K dynamic filter.
+///
+/// DataFusion's Parquet reader evaluates nullable dynamic predicates directly. Vortex can safely
+/// accept them as a best-effort filter because [`TopKDynamicState::threshold`] only activates a
+/// bound for an exact `child <literal` or `child > literal` predicate. DataFusion represents the
+/// nullable cases that need special null-ordering semantics using `is_null`, `is_not_null`, or a
+/// compound predicate; those shapes leave both Vortex bounds at their match-all defaults.
+pub(super) fn topk_dynamic_child(expr: &PhysicalExprRef) -> Option<PhysicalExprRef> {
     let dynamic = expr.downcast_ref::<DynamicFilterPhysicalExpr>()?;
     let children = dynamic.children();
     let [child] = children.as_slice() else {
         return None;
     };
-
-    if child.nullable(schema).ok()? {
-        return None;
-    }
 
     Some(Arc::clone(child))
 }
