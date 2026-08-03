@@ -120,6 +120,7 @@ use vortex_utils::parallelism::get_available_parallelism;
 use crate::convert::exprs::DefaultExpressionConvertor;
 use crate::convert::exprs::ExpressionConvertor;
 use crate::convert::exprs::ProcessedProjection;
+use crate::convert::exprs::can_evaluate_predicate;
 use crate::convert::exprs::make_vortex_predicate;
 use crate::convert::stats::stats_set_to_df;
 
@@ -619,7 +620,7 @@ impl DataSource for VortexDataSource {
 
         let evaluable = filters
             .iter()
-            .filter(|expr| convertor.can_be_evaluated_best_effort(expr, input_schema))
+            .filter(|expr| can_evaluate_predicate(&convertor, expr, input_schema))
             .cloned()
             .collect::<Vec<_>>();
 

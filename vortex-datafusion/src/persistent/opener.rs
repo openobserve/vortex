@@ -57,6 +57,7 @@ use vortex_utils::aliases::dash_map::Entry;
 use crate::VortexAccessPlan;
 use crate::convert::exprs::ExpressionConvertor;
 use crate::convert::exprs::ProcessedProjection;
+use crate::convert::exprs::can_evaluate_predicate;
 use crate::convert::exprs::make_vortex_predicate;
 use crate::convert::schema::calculate_physical_schema;
 use crate::metrics::PARTITION_LABEL;
@@ -367,7 +368,8 @@ impl FileOpener for VortexOpener {
                     let mut pushed = Vec::new();
                     let mut unpushed = Vec::new();
                     for expr in split_conjunction(&f).into_iter().cloned() {
-                        if expr_convertor.can_be_evaluated_best_effort(&expr, &this_file_schema) {
+                        if can_evaluate_predicate(expr_convertor.as_ref(), &expr, &this_file_schema)
+                        {
                             pushed.push(expr);
                         } else if is_dynamic_physical_expr(&expr) {
                             tracing::debug!(

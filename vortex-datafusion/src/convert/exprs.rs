@@ -68,10 +68,25 @@ pub(crate) fn make_vortex_predicate(
 ) -> DFResult<Option<Expression>> {
     let exprs = predicate
         .iter()
-        .map(|e| expr_convertor.convert_predicate(e, schema))
+        .map(|e| {
+            if expr_convertor.can_be_pushed_down(e, schema) {
+                expr_convertor.convert(e.as_ref())
+            } else {
+                expr_convertor.convert_best_effort_predicate(e, schema)
+            }
+        })
         .collect::<DFResult<Vec<_>>>()?;
 
     Ok(and_collect(exprs))
+}
+
+pub(crate) fn can_evaluate_predicate(
+    expr_convertor: &dyn ExpressionConvertor,
+    expr: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+) -> bool {
+    expr_convertor.can_be_pushed_down(expr, schema)
+        || expr_convertor.can_be_evaluated_best_effort(expr, schema)
 }
 
 /// Trait for converting DataFusion expressions to Vortex ones.
@@ -120,17 +135,21 @@ pub trait ExpressionConvertor: Send + Sync {
     /// Can an expression be pushed down given a specific schema
     fn can_be_pushed_down(&self, expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool;
 
-    /// Returns whether Vortex can evaluate an expression as a best-effort optimization while
-    /// DataFusion retains the original expression for exact evaluation.
-    fn can_be_evaluated_best_effort(&self, expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-        self.can_be_pushed_down(expr, schema)
+    /// Returns whether Vortex can conservatively evaluate an expression that cannot be pushed
+    /// down exactly while DataFusion retains it for exact evaluation.
+    fn can_be_evaluated_best_effort(
+        &self,
+        _expr: &Arc<dyn PhysicalExpr>,
+        _schema: &Schema,
+    ) -> bool {
+        false
     }
 
     /// Try and convert a DataFusion [`PhysicalExpr`] into a Vortex [`Expression`].
     fn convert(&self, expr: &dyn PhysicalExpr) -> DFResult<Expression>;
 
-    /// Converts a predicate that may use best-effort evaluation.
-    fn convert_predicate(
+    /// Converts a predicate accepted by [`Self::can_be_evaluated_best_effort`].
+    fn convert_best_effort_predicate(
         &self,
         expr: &Arc<dyn PhysicalExpr>,
         _schema: &Schema,
@@ -338,10 +357,6 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
     }
 
     fn can_be_evaluated_best_effort(&self, expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-        if can_be_pushed_down_impl(expr, schema) {
-            return true;
-        }
-
         topk_dynamic_child(expr).is_some_and(|child| can_be_pushed_down_impl(&child, schema))
     }
 
@@ -434,7 +449,7 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
         ))
     }
 
-    fn convert_predicate(
+    fn convert_best_effort_predicate(
         &self,
         expr: &Arc<dyn PhysicalExpr>,
         schema: &Schema,
@@ -898,7 +913,7 @@ mod tests {
         assert!(!convertor.can_be_pushed_down(&predicate, &schema));
         assert!(convertor.can_be_evaluated_best_effort(&predicate, &schema));
 
-        let vortex_predicate = convertor.convert_predicate(&predicate, &schema)?;
+        let vortex_predicate = convertor.convert_best_effort_predicate(&predicate, &schema)?;
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4]))],
@@ -974,7 +989,7 @@ mod tests {
         let convertor = DefaultExpressionConvertor::default();
 
         assert!(convertor.can_be_evaluated_best_effort(&predicate, &schema));
-        let vortex_predicate = convertor.convert_predicate(&predicate, &schema)?;
+        let vortex_predicate = convertor.convert_best_effort_predicate(&predicate, &schema)?;
 
         dynamic.update(Arc::new(df_expr::BinaryExpr::new(
             child,
@@ -1043,8 +1058,8 @@ mod tests {
             df_expr::lit(ScalarValue::Boolean(Some(true))),
         ));
         let predicate = Arc::clone(&dynamic) as Arc<dyn PhysicalExpr>;
-        let vortex_predicate =
-            DefaultExpressionConvertor::default().convert_predicate(&predicate, &schema)?;
+        let vortex_predicate = DefaultExpressionConvertor::default()
+            .convert_best_effort_predicate(&predicate, &schema)?;
 
         let comparison = Arc::new(df_expr::BinaryExpr::new(
             Arc::clone(&child),

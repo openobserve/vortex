@@ -40,6 +40,7 @@ use super::opener::VortexOpener;
 use crate::VortexTableOptions;
 use crate::convert::exprs::DefaultExpressionConvertor;
 use crate::convert::exprs::ExpressionConvertor;
+use crate::convert::exprs::can_evaluate_predicate;
 use crate::persistent::reader::DefaultVortexReaderFactory;
 use crate::persistent::reader::VortexReaderFactory;
 
@@ -488,8 +489,11 @@ impl FileSource for VortexSource {
         let scan_filters = supported_filters
             .iter()
             .filter(|p| {
-                self.expression_convertor
-                    .can_be_evaluated_best_effort(&p.predicate, self.table_schema.file_schema())
+                can_evaluate_predicate(
+                    self.expression_convertor.as_ref(),
+                    &p.predicate,
+                    self.table_schema.file_schema(),
+                )
             })
             .map(|p| Arc::clone(&p.predicate))
             .collect::<Vec<_>>();
@@ -550,11 +554,13 @@ mod tests {
     use datafusion_physical_expr::expressions as df_expr;
     use datafusion_physical_expr::expressions::Column;
     use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
+    use datafusion_physical_expr::utils::split_conjunction;
     use object_store::memory::InMemory;
     use vortex::VortexSessionDefault;
 
     use super::*;
     use crate::convert::exprs::ProcessedProjection;
+    use crate::convert::exprs::make_vortex_predicate;
 
     struct TrackingExpressionConvertor {
         inner: DefaultExpressionConvertor,
@@ -567,18 +573,24 @@ mod tests {
 
         fn can_be_evaluated_best_effort(&self, expr: &PhysicalExprRef, schema: &Schema) -> bool {
             self.inner.can_be_evaluated_best_effort(expr, schema)
+                && !self.inner.can_be_pushed_down(expr, schema)
         }
 
         fn convert(&self, expr: &dyn PhysicalExpr) -> DFResult<vortex::expr::Expression> {
             self.inner.convert(expr)
         }
 
-        fn convert_predicate(
+        fn convert_best_effort_predicate(
             &self,
             expr: &PhysicalExprRef,
             schema: &Schema,
         ) -> DFResult<vortex::expr::Expression> {
-            self.inner.convert_predicate(expr, schema)
+            if self.inner.can_be_pushed_down(expr, schema) {
+                return Err(datafusion_common::DataFusionError::Internal(
+                    "exact predicate routed through best-effort conversion".to_owned(),
+                ));
+            }
+            self.inner.convert_best_effort_predicate(expr, schema)
         }
 
         fn split_projection(
@@ -740,6 +752,64 @@ mod tests {
             .clone();
         assert!(updated_source.full_predicate.is_some());
         assert!(updated_source.vortex_predicate.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn try_pushdown_filters_keeps_exact_filters_with_best_effort_filters() -> anyhow::Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let expression_convertor = Arc::new(TrackingExpressionConvertor {
+            inner: DefaultExpressionConvertor::default(),
+        }) as Arc<dyn ExpressionConvertor>;
+        let source =
+            sort_test_source(Arc::clone(&schema)).with_expression_convertor(expression_convertor);
+        let child = Arc::new(Column::new("value", 0)) as PhysicalExprRef;
+        let exact_filter = Arc::new(df_expr::BinaryExpr::new(
+            Arc::clone(&child),
+            Operator::Gt,
+            df_expr::lit(ScalarValue::Int32(Some(0))),
+        )) as PhysicalExprRef;
+        let best_effort_filter = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![child],
+            df_expr::lit(ScalarValue::Boolean(Some(true))),
+        )) as PhysicalExprRef;
+
+        let result = source.try_pushdown_filters(
+            vec![exact_filter, best_effort_filter],
+            &ConfigOptions::new(),
+        )?;
+
+        assert!(matches!(
+            result.filters.as_slice(),
+            [PushedDown::Yes, PushedDown::No]
+        ));
+        let updated_source = result
+            .updated_node
+            .ok_or_else(|| anyhow::anyhow!("expected updated VortexSource"))?
+            .downcast_ref::<VortexSource>()
+            .ok_or_else(|| anyhow::anyhow!("expected VortexSource"))?
+            .clone();
+        let vortex_predicate = updated_source
+            .vortex_predicate
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("expected Vortex predicate"))?;
+        let scan_filters = split_conjunction(vortex_predicate)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(scan_filters.len(), 2);
+        assert!(
+            make_vortex_predicate(
+                updated_source.expression_convertor.as_ref(),
+                &scan_filters,
+                &schema,
+            )?
+            .is_some()
+        );
         Ok(())
     }
 
