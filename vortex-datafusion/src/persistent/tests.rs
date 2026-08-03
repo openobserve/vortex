@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use anyhow::anyhow;
@@ -36,10 +37,14 @@ use vortex::layout::LayoutStrategy;
 use vortex::layout::layouts::chunked::writer::ChunkedLayoutStrategy;
 use vortex::layout::layouts::flat::writer::FlatLayoutStrategy;
 use vortex::layout::layouts::table::TableStrategy;
+use vortex::layout::layouts::zoned::writer::ZonedLayoutOptions;
+use vortex::layout::layouts::zoned::writer::ZonedStrategy;
 use vortex::session::VortexSession;
 
 use crate::VortexFormatFactory;
+use crate::VortexTableOptions;
 use crate::common_tests::TestSessionContext;
+use crate::metrics::VortexMetricsFinder;
 
 fn make_session(
     object_store: Arc<dyn ObjectStore>,
@@ -96,6 +101,119 @@ fn batch_values(batches: &[RecordBatch]) -> Vec<i32> {
     }
 
     values
+}
+
+fn make_topk_pruning_session(
+    object_store: Arc<dyn ObjectStore>,
+    dynamic_filter_pushdown: bool,
+) -> SessionContext {
+    let factory = Arc::new(VortexFormatFactory::new().with_options(VortexTableOptions {
+        scan_concurrency: Some(1),
+        ..Default::default()
+    }));
+    let mut config = SessionConfig::new()
+        .with_target_partitions(1)
+        .with_batch_size(4_096)
+        .with_repartition_file_scans(false);
+    config
+        .options_mut()
+        .optimizer
+        .enable_dynamic_filter_pushdown = dynamic_filter_pushdown;
+    config
+        .options_mut()
+        .optimizer
+        .enable_topk_dynamic_filter_pushdown = dynamic_filter_pushdown;
+
+    let mut state = SessionStateBuilder::new()
+        .with_config(config)
+        .with_default_features()
+        .with_table_factory(
+            factory.get_ext().to_uppercase(),
+            Arc::new(DefaultTableFactory::new()),
+        )
+        .with_object_store(&url::Url::try_from("file://").unwrap(), object_store);
+
+    if let Some(file_formats) = state.file_formats() {
+        file_formats.push(factory as _);
+    }
+
+    SessionContext::new_with_state(state.build()).enable_url_table()
+}
+
+async fn write_chunked_i32_file(
+    store: Arc<dyn ObjectStore>,
+    path: &str,
+    starts: impl IntoIterator<Item = i32>,
+    split_len: usize,
+) -> anyhow::Result<u64> {
+    let split_len_i32 = i32::try_from(split_len)?;
+    let chunks = starts
+        .into_iter()
+        .map(|start| {
+            StructArray::try_new(
+                ["value"].into(),
+                vec![Buffer::from_iter(start..start + split_len_i32).into_array()],
+                split_len,
+                Validity::NonNullable,
+            )
+            .map(IntoArray::into_array)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let table = ChunkedArray::from_iter(chunks).into_array();
+    let flat: Arc<dyn LayoutStrategy> = Arc::new(FlatLayoutStrategy::default());
+    let block_size = NonZeroUsize::new(split_len)
+        .ok_or_else(|| anyhow!("the test zone size must be non-zero"))?;
+    let strategy: Arc<dyn LayoutStrategy> = Arc::new(TableStrategy::new(
+        Arc::clone(&flat),
+        Arc::new(ZonedStrategy::new(
+            ChunkedLayoutStrategy::new(FlatLayoutStrategy::default()),
+            FlatLayoutStrategy::default(),
+            ZonedLayoutOptions {
+                block_size,
+                ..Default::default()
+            },
+        )),
+    ));
+    let path = object_store::path::Path::parse(path)?;
+    let mut writer = ObjectStoreWrite::new(store, &path).await?;
+    let summary = VortexSession::default()
+        .write_options()
+        .with_strategy(strategy)
+        .write(&mut writer, table.to_array_stream())
+        .await?;
+    writer.shutdown().await?;
+
+    Ok(summary.size())
+}
+
+async fn execute_topk_with_read_bytes(
+    store: Arc<dyn ObjectStore>,
+    dynamic_filter_pushdown: bool,
+) -> anyhow::Result<(Vec<i32>, usize, String)> {
+    let ctx = make_topk_pruning_session(store, dynamic_filter_pushdown);
+    ctx.sql(
+        "CREATE EXTERNAL TABLE topk_pruning_data \
+             (value INT NOT NULL) \
+         STORED AS vortex \
+         LOCATION '/topk-pruning/'",
+    )
+    .await?;
+    let dataframe = ctx
+        .sql("SELECT value FROM topk_pruning_data ORDER BY value ASC LIMIT 10")
+        .await?;
+    let physical_plan = dataframe.create_physical_plan().await?;
+    let rendered_plan = DisplayableExecutionPlan::new(physical_plan.as_ref())
+        .tree_render()
+        .to_string();
+    let batches =
+        datafusion_physical_plan::collect(Arc::clone(&physical_plan), ctx.task_ctx()).await?;
+    let read_bytes = VortexMetricsFinder::find_all(physical_plan.as_ref())
+        .iter()
+        .filter_map(|metrics| metrics.sum_by_name("vortex.io.read.total_size"))
+        .map(|metric| metric.as_usize())
+        .sum();
+
+    Ok((batch_values(&batches), read_bytes, rendered_plan))
 }
 
 #[rstest]
@@ -180,6 +298,52 @@ async fn topk_dynamic_filter_is_retained_by_vortex_scan() -> anyhow::Result<()> 
 
     assert!(plan.contains("DynamicFilter"), "{plan}");
     assert_eq!(batch_values(&df.collect().await?), vec![1, 2]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn topk_dynamic_filter_reduces_multi_file_multi_split_io() -> anyhow::Result<()> {
+    let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+    let files = [
+        ("/topk-pruning/00-low.vortex", [0, 100_000, 200_000]),
+        ("/topk-pruning/01-high.vortex", [300_000, 400_000, 500_000]),
+        (
+            "/topk-pruning/02-higher.vortex",
+            [600_000, 700_000, 800_000],
+        ),
+    ];
+    let mut file_sizes = Vec::with_capacity(files.len());
+    for (path, starts) in files {
+        let file_size = write_chunked_i32_file(Arc::clone(&store), path, starts, 4_096).await?;
+        file_sizes.push((path, file_size));
+    }
+
+    for (path, file_size) in file_sizes {
+        let reader = Arc::new(ObjectStoreReadAt::new(
+            Arc::clone(&store),
+            object_store::path::Path::parse(path)?,
+            Handle::find().ok_or_else(|| anyhow!("tokio runtime should be available in tests"))?,
+        ));
+        let vxf = VortexSession::default()
+            .open_options()
+            .with_file_size(file_size)
+            .open_read(reader)
+            .await?;
+        assert_eq!(vxf.splits()?.len(), 3);
+    }
+
+    let (filtered_values, filtered_read_bytes, filtered_plan) =
+        execute_topk_with_read_bytes(Arc::clone(&store), true).await?;
+    let (baseline_values, baseline_read_bytes, _) =
+        execute_topk_with_read_bytes(store, false).await?;
+
+    assert!(filtered_plan.contains("DynamicFilter"), "{filtered_plan}");
+    assert_eq!(filtered_values, (0_i32..10).collect::<Vec<_>>());
+    assert_eq!(baseline_values, filtered_values);
+    assert!(
+        baseline_read_bytes > filtered_read_bytes.saturating_mul(2),
+        "expected dynamic TopK pruning to skip at least one file's worth of reads: filtered={filtered_read_bytes}, baseline={baseline_read_bytes}"
+    );
     Ok(())
 }
 
