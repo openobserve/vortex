@@ -10,6 +10,7 @@ use futures::FutureExt;
 use futures::TryFutureExt;
 use futures::future::BoxFuture;
 use futures::try_join;
+use parking_lot::RwLock;
 use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::MaskFuture;
@@ -27,6 +28,7 @@ use vortex_array::expr::root;
 use vortex_array::expr::transform::partition_bound_annotations;
 use vortex_array::optimizer::ArrayOptimizer;
 use vortex_array::scalar_fn::ScalarFnVTableExt;
+use vortex_array::scalar_fn::fns::dynamic::DynamicExprUpdates;
 use vortex_array::scalar_fn::fns::pack::Pack;
 use vortex_array::scalar_fn::fns::pack::PackOptions;
 use vortex_array::scalar_fn::is_negative_cost;
@@ -54,8 +56,9 @@ pub struct DictReader {
     values_len: usize,
     /// Cached dict values array
     values_array: OnceLock<SharedArrayFuture>,
-    /// Cache of expression evaluation results on the values array by expression
-    values_evals: DashMap<BoundExpression, SharedArrayFuture>,
+    /// Cache of expression evaluation results on the values array by expression and dynamic
+    /// expression version.
+    values_evals: DashMap<BoundExpression, Arc<ValuesEvalResult>>,
 
     values: LayoutReaderRef,
     codes: LayoutReaderRef,
@@ -147,29 +150,79 @@ impl DictReader {
         })
     }
 
-    fn values_eval(&self, expr: BoundExpression) -> SharedArrayFuture {
+    fn uncached_values_eval(&self, expr: BoundExpression) -> SharedArrayFuture {
         // This is unsound since we cannot be sure that all the values are referenced in the query
         // after applying the filter, so if the expression is fallible this might fail when it
         // shouldn't.
         // TODO(joe): fixme
 
-        // Check cache first with read-only lock
-        if let Some(fut) = self.values_evals.get(&expr) {
-            return fut.clone();
-        }
+        self.values_array_uncanonical()
+            .map(move |array| {
+                let array = array?.apply_bound(&expr)?;
+                Ok(SharedArray::new(array).into_array())
+            })
+            .boxed()
+            .shared()
+    }
 
-        self.values_evals
+    fn values_eval(&self, expr: BoundExpression) -> SharedArrayFuture {
+        // Dynamic expressions have stable identity while their captured values change. Keep the
+        // cache entry, but replace its future whenever DynamicExprUpdates observes a new value.
+        let cached = self
+            .values_evals
             .entry(expr.clone())
             .or_insert_with(|| {
-                self.values_array_uncanonical()
-                    .map(move |array| {
-                        let array = array?.apply_bound(&expr)?;
-                        Ok(SharedArray::new(array).into_array())
-                    })
-                    .boxed()
-                    .shared()
+                Arc::new(ValuesEvalResult::new(
+                    &expr,
+                    self.uncached_values_eval(expr.clone()),
+                ))
             })
-            .clone()
+            .clone();
+
+        cached.result(|| self.uncached_values_eval(expr))
+    }
+}
+
+struct ValuesEvalResult {
+    dynamic_updates: Option<DynamicExprUpdates>,
+    latest_result: RwLock<(u64, SharedArrayFuture)>,
+}
+
+impl ValuesEvalResult {
+    fn new(expr: &BoundExpression, initial_result: SharedArrayFuture) -> Self {
+        let dynamic_updates = DynamicExprUpdates::new(&expr.unbind());
+        let version = dynamic_updates
+            .as_ref()
+            .map_or(0, DynamicExprUpdates::version);
+
+        Self {
+            dynamic_updates,
+            latest_result: RwLock::new((version, initial_result)),
+        }
+    }
+
+    fn result(&self, next_result: impl FnOnce() -> SharedArrayFuture) -> SharedArrayFuture {
+        let Some(dynamic_updates) = &self.dynamic_updates else {
+            return self.latest_result.read().1.clone();
+        };
+
+        let version = dynamic_updates.version();
+
+        {
+            let guard = self.latest_result.read();
+            if guard.0 >= version {
+                return guard.1.clone();
+            }
+        }
+
+        let mut guard = self.latest_result.write();
+        if guard.0 >= version {
+            return guard.1.clone();
+        }
+
+        let result = next_result();
+        *guard = (version, result.clone());
+        result
     }
 }
 
@@ -358,6 +411,8 @@ impl LayoutReader for DictReader {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
 
     use rstest::rstest;
     use vortex_array::ArrayContext;
@@ -379,6 +434,7 @@ mod tests {
     use vortex_array::expr::Expression;
     use vortex_array::expr::byte_length;
     use vortex_array::expr::cast;
+    use vortex_array::expr::dynamic;
     use vortex_array::expr::eq;
     use vortex_array::expr::get_item;
     use vortex_array::expr::is_not_null;
@@ -386,6 +442,7 @@ mod tests {
     use vortex_array::expr::lit;
     use vortex_array::expr::pack;
     use vortex_array::expr::root;
+    use vortex_array::scalar_fn::fns::operators::CompareOperator;
     use vortex_array::validity::Validity;
     use vortex_btrblocks::BtrBlocksCompressor;
     use vortex_error::VortexExpect;
@@ -603,6 +660,60 @@ mod tests {
                 .unwrap();
 
             assert_arrays_eq!(mask.into_array(), BoolArray::from_iter(expected), &mut ctx);
+        })
+    }
+
+    #[expect(clippy::disallowed_methods, reason = "test-only id")]
+    #[test]
+    fn dynamic_filter_recomputes_cached_dictionary_values() {
+        block_on(|handle| async move {
+            let session = session_with_handle(handle);
+            let array = VarBinArray::from_iter(
+                (0..4_096).map(|idx| Some(["a", "b", "a", "c"][idx % 4])),
+                DType::Utf8(Nullability::NonNullable),
+            )
+            .into_array();
+            let (layout, segments) = write_dict_layout(array, &session).await;
+            assert_eq!(layout.encoding_id(), LayoutId::new("vortex.dict"));
+
+            let reader = layout
+                .new_reader("".into(), segments, &session, &Default::default())
+                .unwrap();
+            let threshold_tightened = Arc::new(AtomicBool::new(false));
+            let dynamic_threshold = Arc::clone(&threshold_tightened);
+            let filter = dynamic(
+                CompareOperator::Lt,
+                move || {
+                    Some(
+                        if dynamic_threshold.load(Ordering::Relaxed) {
+                            "b"
+                        } else {
+                            "c"
+                        }
+                        .into(),
+                    )
+                },
+                DType::Utf8(Nullability::NonNullable),
+                true,
+                root(),
+            )
+            .bind(reader.dtype())
+            .unwrap();
+
+            let first = reader
+                .filter_evaluation(&(0..4_096), &filter, MaskFuture::new_true(4_096))
+                .unwrap()
+                .await
+                .unwrap();
+            assert_eq!(first.true_count(), 3_072);
+
+            threshold_tightened.store(true, Ordering::Relaxed);
+            let second = reader
+                .filter_evaluation(&(0..4_096), &filter, MaskFuture::new_true(4_096))
+                .unwrap()
+                .await
+                .unwrap();
+            assert_eq!(second.true_count(), 2_048);
         })
     }
 

@@ -964,7 +964,7 @@ mod tests {
     }
 
     #[test]
-    fn nullable_topk_dynamic_filter_uses_null_as_false_semantics() -> anyhow::Result<()> {
+    fn nullable_topk_dynamic_filter_conservatively_retains_nulls() -> anyhow::Result<()> {
         use datafusion::arrow::array::Int32Array;
         use datafusion::arrow::array::RecordBatch;
         use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
@@ -1008,7 +1008,7 @@ mod tests {
                 .apply(&vortex_predicate)?
                 .null_as_false()
                 .execute(&mut ctx)?,
-            Mask::from_iter([true, false, false])
+            Mask::from_iter([true, true, false])
         );
 
         Ok(())
@@ -1034,7 +1034,7 @@ mod tests {
     }
 
     #[test]
-    fn compound_nullable_topk_predicate_remains_match_all() -> anyhow::Result<()> {
+    fn compound_nullable_topk_predicate_tracks_desc_threshold() -> anyhow::Result<()> {
         use datafusion::arrow::array::Int32Array;
         use datafusion::arrow::array::RecordBatch;
         use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
@@ -1063,8 +1063,8 @@ mod tests {
 
         let comparison = Arc::new(df_expr::BinaryExpr::new(
             Arc::clone(&child),
-            DFOperator::Lt,
-            df_expr::lit(ScalarValue::Int32(Some(3))),
+            DFOperator::Gt,
+            df_expr::lit(ScalarValue::Int32(Some(2))),
         )) as Arc<dyn PhysicalExpr>;
         dynamic.update(Arc::new(df_expr::BinaryExpr::new(
             df_expr::is_null(child)?,
@@ -1085,7 +1085,7 @@ mod tests {
                 .execute::<Canonical>(&mut ctx)?
                 .into_bool()
                 .to_bit_buffer(),
-            BoolArray::from_iter([true, true, true]).to_bit_buffer()
+            BoolArray::from_iter([false, true, true]).to_bit_buffer()
         );
 
         Ok(())

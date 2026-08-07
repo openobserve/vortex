@@ -14,6 +14,8 @@ use vortex::dtype::DType;
 use vortex::expr::Expression;
 use vortex::expr::and;
 use vortex::expr::dynamic;
+use vortex::expr::is_null;
+use vortex::expr::or;
 use vortex::scalar::Scalar;
 use vortex::scalar::ScalarValue;
 use vortex::scalar_fn::fns::operators::CompareOperator;
@@ -22,11 +24,9 @@ use crate::convert::FromDataFusion;
 
 /// Returns the single child used by a Top-K dynamic filter.
 ///
-/// DataFusion's Parquet reader evaluates nullable dynamic predicates directly. Vortex can safely
-/// accept them as a best-effort filter because [`TopKDynamicState::threshold`] only activates a
-/// bound for an exact `child <literal` or `child > literal` predicate. DataFusion represents the
-/// nullable cases that need special null-ordering semantics using `is_null`, `is_not_null`, or a
-/// compound predicate; those shapes leave both Vortex bounds at their match-all defaults.
+/// DataFusion's Parquet reader evaluates nullable dynamic predicates directly. Vortex accepts
+/// single-column Top-K filters as best-effort predicates and conservatively retains nulls; the
+/// exact DataFusion predicate above the scan remains responsible for null ordering semantics.
 pub(super) fn topk_dynamic_child(expr: &PhysicalExprRef) -> Option<PhysicalExprRef> {
     let dynamic = expr.downcast_ref::<DynamicFilterPhysicalExpr>()?;
     let children = dynamic.children();
@@ -41,7 +41,8 @@ pub(super) fn topk_dynamic_child(expr: &PhysicalExprRef) -> Option<PhysicalExprR
 ///
 /// DataFusion initially represents the filter as `true`, so the sort direction is not available
 /// until the first threshold arrives. Each bound therefore defaults to `true` and only activates
-/// when the current expression exactly matches its comparison operator.
+/// when the current expression matches either `child <op> literal` or DataFusion's nullable
+/// `is_null(child) OR child <op> literal` form.
 pub(super) fn convert_topk_dynamic_filter(
     expr: &PhysicalExprRef,
     child: PhysicalExprRef,
@@ -62,7 +63,7 @@ pub(super) fn convert_topk_dynamic_filter(
     let lt_state = Arc::clone(&state);
     let gt_state = Arc::clone(&state);
 
-    Ok(and(
+    let bounds = and(
         dynamic(
             CompareOperator::Lt,
             move || lt_state.threshold(DFOperator::Lt),
@@ -73,11 +74,21 @@ pub(super) fn convert_topk_dynamic_filter(
         dynamic(
             CompareOperator::Gt,
             move || gt_state.threshold(DFOperator::Gt),
-            rhs_dtype,
+            rhs_dtype.clone(),
             true,
-            lhs,
+            lhs.clone(),
         ),
-    ))
+    );
+
+    // A nullable Top-K predicate may switch between a plain comparison and DataFusion's
+    // `is_null(child) OR comparison` shape as its threshold changes. The Vortex dynamic scalar
+    // only carries the comparison value, so always retaining nulls is the conservative choice.
+    // DataFusion re-evaluates the exact dynamic predicate above this best-effort scan filter.
+    Ok(if rhs_dtype.is_nullable() {
+        or(is_null(lhs), bounds)
+    } else {
+        bounds
+    })
 }
 
 struct TopKDynamicState {
@@ -90,11 +101,7 @@ impl TopKDynamicState {
     fn threshold(&self, expected_operator: DFOperator) -> Option<ScalarValue> {
         let dynamic = self.filter.downcast_ref::<DynamicFilterPhysicalExpr>()?;
         let current = dynamic.current().ok()?;
-        let comparison = current.downcast_ref::<df_expr::BinaryExpr>()?;
-
-        if *comparison.op() != expected_operator || !comparison.left().eq(&self.child) {
-            return None;
-        }
+        let comparison = self.comparison(&current, expected_operator)?;
 
         let literal = comparison.right().downcast_ref::<df_expr::Literal>()?;
         let scalar = Scalar::from_df(literal.value());
@@ -103,5 +110,49 @@ impl TopKDynamicState {
         }
 
         scalar.into_value()
+    }
+
+    fn comparison<'a>(
+        &self,
+        current: &'a PhysicalExprRef,
+        expected_operator: DFOperator,
+    ) -> Option<&'a df_expr::BinaryExpr> {
+        if let Some(comparison) = self.direct_comparison(current, expected_operator) {
+            return Some(comparison);
+        }
+
+        let compound = current.downcast_ref::<df_expr::BinaryExpr>()?;
+        if *compound.op() != DFOperator::Or {
+            return None;
+        }
+
+        self.null_aware_comparison(compound.left(), compound.right(), expected_operator)
+            .or_else(|| {
+                self.null_aware_comparison(compound.right(), compound.left(), expected_operator)
+            })
+    }
+
+    fn null_aware_comparison<'a>(
+        &self,
+        null_expr: &PhysicalExprRef,
+        comparison: &'a PhysicalExprRef,
+        expected_operator: DFOperator,
+    ) -> Option<&'a df_expr::BinaryExpr> {
+        let is_null = null_expr.downcast_ref::<df_expr::IsNullExpr>()?;
+        if !is_null.arg().eq(&self.child) {
+            return None;
+        }
+
+        self.direct_comparison(comparison, expected_operator)
+    }
+
+    fn direct_comparison<'a>(
+        &self,
+        expr: &'a PhysicalExprRef,
+        expected_operator: DFOperator,
+    ) -> Option<&'a df_expr::BinaryExpr> {
+        let comparison = expr.downcast_ref::<df_expr::BinaryExpr>()?;
+        (*comparison.op() == expected_operator && comparison.left().eq(&self.child))
+            .then_some(comparison)
     }
 }

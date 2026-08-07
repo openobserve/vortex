@@ -10,6 +10,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use parking_lot::RwLock;
 use vortex_array::MaskFuture;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldMask;
@@ -37,14 +38,62 @@ use crate::pruning::can_prune_file_stats;
 /// When file-level stats prove that a filter expression is false for the entire file,
 /// it returns an all-false mask immediately — avoiding all downstream I/O.
 ///
-/// Pruning results are cached per-expression since file-level stats are global
-/// (the result is the same regardless of which row range is requested).
+/// Pruning results are cached per-expression since file-level stats are global (the result is the
+/// same regardless of which row range is requested). Dynamic expressions additionally track their
+/// captured scalar version so an updated bound invalidates only the cached result.
 pub struct FileStatsLayoutReader {
     child: LayoutReaderRef,
     file_stats: FileStatistics,
     struct_fields: StructFields,
     session: VortexSession,
-    prune_cache: DashMap<ExactBoundExpr, bool>,
+    prune_cache: DashMap<ExactBoundExpr, Arc<FilePruningResult>>,
+}
+
+struct FilePruningResult {
+    dynamic_updates: Option<DynamicExprUpdates>,
+    latest_result: RwLock<(u64, bool)>,
+}
+
+impl FilePruningResult {
+    fn try_new(
+        expr: &Expression,
+        evaluate: impl FnOnce() -> VortexResult<bool>,
+    ) -> VortexResult<Self> {
+        let dynamic_updates = DynamicExprUpdates::new(expr);
+        let version = dynamic_updates
+            .as_ref()
+            .map_or(0, DynamicExprUpdates::version);
+        let initial_result = evaluate()?;
+
+        Ok(Self {
+            dynamic_updates,
+            latest_result: RwLock::new((version, initial_result)),
+        })
+    }
+
+    fn result(&self, evaluate: impl FnOnce() -> VortexResult<bool>) -> VortexResult<bool> {
+        let Some(dynamic_updates) = &self.dynamic_updates else {
+            return Ok(self.latest_result.read().1);
+        };
+
+        let version = dynamic_updates.version();
+
+        {
+            let guard = self.latest_result.read();
+            if guard.0 >= version {
+                return Ok(guard.1);
+            }
+        }
+
+        let mut guard = self.latest_result.write();
+        if guard.0 >= version {
+            return Ok(guard.1);
+        }
+
+        let result = evaluate()?;
+        *guard = (version, result);
+        Ok(result)
+    }
 }
 
 impl FileStatsLayoutReader {
@@ -120,30 +169,16 @@ impl LayoutReader for FileStatsLayoutReader {
         mask: Mask,
     ) -> VortexResult<MaskFuture> {
         let expression = expr.unbind();
-
-        // Dynamic expressions keep stable identity while their values change, so a result cached
-        // by expression would become stale as soon as the bound is updated.
-        if DynamicExprUpdates::new(&expression).is_some() {
-            return if self.evaluate_file_stats(&expression)? {
-                Ok(MaskFuture::ready(Mask::new_false(mask.len())))
-            } else {
-                self.child.pruning_evaluation(row_range, expr, mask)
-            };
-        }
-
         let key = ExactBoundExpr(expr.clone());
-
-        // Check cache first with read-only lock.
-        if let Some(pruned) = self.prune_cache.get(&key) {
-            if *pruned {
-                return Ok(MaskFuture::ready(Mask::new_false(mask.len())));
-            }
-            return self.child.pruning_evaluation(row_range, expr, mask);
-        }
-
-        // Evaluate and cache.
-        let pruned = self.evaluate_file_stats(&expression)?;
-        self.prune_cache.insert(key, pruned);
+        let cached = if let Some(cached) = self.prune_cache.get(&key) {
+            Arc::clone(&cached)
+        } else {
+            let candidate = Arc::new(FilePruningResult::try_new(&expression, || {
+                self.evaluate_file_stats(&expression)
+            })?);
+            self.prune_cache.entry(key).or_insert(candidate).clone()
+        };
+        let pruned = cached.result(|| self.evaluate_file_stats(&expression))?;
 
         if pruned {
             Ok(MaskFuture::ready(Mask::new_false(mask.len())))
@@ -331,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_filter_updates_bypass_pruning_cache() -> VortexResult<()> {
+    fn dynamic_filter_updates_invalidate_pruning_cache_version() -> VortexResult<()> {
         block_on(|handle| async {
             let session = SESSION.clone().with_handle(handle);
             let ctx = ArrayContext::empty();
@@ -365,7 +400,8 @@ mod tests {
                 DType::Primitive(PType::I32, Nullability::NonNullable),
                 true,
                 get_item("col", root()),
-            );
+            )
+            .bind(reader.dtype())?;
 
             let first = reader
                 .pruning_evaluation(&(0..5), &expr, Mask::new_true(5))?

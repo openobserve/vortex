@@ -106,9 +106,10 @@ fn batch_values(batches: &[RecordBatch]) -> Vec<i32> {
 fn make_topk_pruning_session(
     object_store: Arc<dyn ObjectStore>,
     dynamic_filter_pushdown: bool,
+    scan_concurrency: Option<usize>,
 ) -> SessionContext {
     let factory = Arc::new(VortexFormatFactory::new().with_options(VortexTableOptions {
-        scan_concurrency: Some(1),
+        scan_concurrency,
         ..Default::default()
     }));
     let mut config = SessionConfig::new()
@@ -189,8 +190,9 @@ async fn write_chunked_i32_file(
 async fn execute_topk_with_read_bytes(
     store: Arc<dyn ObjectStore>,
     dynamic_filter_pushdown: bool,
+    scan_concurrency: Option<usize>,
 ) -> anyhow::Result<(Vec<i32>, usize, String)> {
-    let ctx = make_topk_pruning_session(store, dynamic_filter_pushdown);
+    let ctx = make_topk_pruning_session(store, dynamic_filter_pushdown, scan_concurrency);
     ctx.sql(
         "CREATE EXTERNAL TABLE topk_pruning_data \
              (value INT NOT NULL) \
@@ -333,9 +335,9 @@ async fn topk_dynamic_filter_reduces_multi_file_multi_split_io() -> anyhow::Resu
     }
 
     let (filtered_values, filtered_read_bytes, filtered_plan) =
-        execute_topk_with_read_bytes(Arc::clone(&store), true).await?;
+        execute_topk_with_read_bytes(Arc::clone(&store), true, Some(1)).await?;
     let (baseline_values, baseline_read_bytes, _) =
-        execute_topk_with_read_bytes(store, false).await?;
+        execute_topk_with_read_bytes(store, false, Some(1)).await?;
 
     assert!(filtered_plan.contains("DynamicFilter"), "{filtered_plan}");
     assert_eq!(filtered_values, (0_i32..10).collect::<Vec<_>>());
@@ -343,6 +345,48 @@ async fn topk_dynamic_filter_reduces_multi_file_multi_split_io() -> anyhow::Resu
     assert!(
         baseline_read_bytes > filtered_read_bytes.saturating_mul(2),
         "expected dynamic TopK pruning to skip at least one file's worth of reads: filtered={filtered_read_bytes}, baseline={baseline_read_bytes}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn topk_dynamic_filter_reduces_io_at_default_concurrency() -> anyhow::Result<()> {
+    let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+    let files = [
+        (
+            "/topk-pruning/00-low.vortex",
+            [0, 100_000, 200_000, 300_000],
+        ),
+        (
+            "/topk-pruning/01-high.vortex",
+            [400_000, 500_000, 600_000, 700_000],
+        ),
+        (
+            "/topk-pruning/02-higher.vortex",
+            [800_000, 900_000, 1_000_000, 1_100_000],
+        ),
+        (
+            "/topk-pruning/03-highest.vortex",
+            [1_200_000, 1_300_000, 1_400_000, 1_500_000],
+        ),
+    ];
+    for (path, starts) in files {
+        write_chunked_i32_file(Arc::clone(&store), path, starts, 16_384).await?;
+    }
+
+    // `None` exercises Vortex's default scan concurrency (currently four). Each natural split is
+    // also four times larger than DataFusion's configured output batch size.
+    let (filtered_values, filtered_read_bytes, filtered_plan) =
+        execute_topk_with_read_bytes(Arc::clone(&store), true, None).await?;
+    let (baseline_values, baseline_read_bytes, _) =
+        execute_topk_with_read_bytes(store, false, None).await?;
+
+    assert!(filtered_plan.contains("DynamicFilter"), "{filtered_plan}");
+    assert_eq!(filtered_values, (0_i32..10).collect::<Vec<_>>());
+    assert_eq!(baseline_values, filtered_values);
+    assert!(
+        baseline_read_bytes > filtered_read_bytes,
+        "expected dynamic TopK pruning to reduce reads with default concurrency: filtered={filtered_read_bytes}, baseline={baseline_read_bytes}"
     );
     Ok(())
 }
