@@ -5,6 +5,7 @@ use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
+use arrow_schema::DataType as ArrowDataType;
 use arrow_schema::Schema;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -619,6 +620,7 @@ impl FileFormat for VortexFormat {
                     stats_set.get(Stat::Min),
                     stats_dtype,
                     &target_dtype,
+                    field.data_type(),
                 );
 
                 let max = scalar_stat_to_df(
@@ -626,6 +628,7 @@ impl FileFormat for VortexFormat {
                     stats_set.get(Stat::Max),
                     stats_dtype,
                     &target_dtype,
+                    field.data_type(),
                 );
 
                 let null_count = stats_set.get_as::<usize>(Stat::NullCount, &PType::U64.into());
@@ -713,6 +716,7 @@ fn scalar_stat_to_df(
     value: Precision<VortexScalarValue>,
     stats_dtype: &DType,
     target_dtype: &DType,
+    arrow_type: &ArrowDataType,
 ) -> Precision<DFScalarValue> {
     let Some(stat_dtype) = stat.dtype(stats_dtype) else {
         return Precision::Absent;
@@ -720,9 +724,19 @@ fn scalar_stat_to_df(
 
     value
         .map(|stat_value| {
-            Scalar::try_new(stat_dtype, Some(stat_value))?
+            let scalar = Scalar::try_new(stat_dtype, Some(stat_value))?
                 .cast(target_dtype)?
-                .try_to_df()
+                .try_to_df()?;
+            // DType has no view types, so a Utf8View/BinaryView field yields a
+            // Utf8/Binary scalar here; DataFusion requires statistics typed
+            // exactly as the schema field (e.g. interval analysis asserts it).
+            if scalar.data_type() == *arrow_type {
+                Ok(scalar)
+            } else {
+                scalar.cast_to(arrow_type).map_err(|e| {
+                    vortex_err!("Failed to cast {} statistic to {arrow_type}: {e}", stat)
+                })
+            }
         })
         .transpose()
         .unwrap_or(Precision::Absent)
@@ -733,6 +747,25 @@ mod tests {
 
     use super::*;
     use crate::common_tests::TestSessionContext;
+
+    #[test]
+    fn stats_scalar_cast_to_arrow_view_type() {
+        let dtype = DType::Utf8(Nullability::Nullable);
+        let value = Scalar::from("abc")
+            .into_value()
+            .vortex_expect("non-null scalar");
+        let min = scalar_stat_to_df(
+            Stat::Min,
+            Precision::exact(value),
+            &dtype,
+            &dtype,
+            &ArrowDataType::Utf8View,
+        );
+        assert_eq!(
+            min.as_exact(),
+            Some(DFScalarValue::Utf8View(Some("abc".to_string())))
+        );
+    }
 
     #[tokio::test]
     async fn create_table() -> anyhow::Result<()> {

@@ -256,7 +256,8 @@ impl VortexDataSourceBuilder {
         .await?
         .iter()
         .zip(fields.fields())
-        .map(|(stats, dtype)| stats_set_to_df(stats, &dtype))
+        .zip(arrow_schema.fields())
+        .map(|((stats, dtype), field)| stats_set_to_df(stats, &dtype, field.data_type()))
         .collect::<VortexResult<Vec<_>>>()?;
 
         Ok(VortexDataSource {
