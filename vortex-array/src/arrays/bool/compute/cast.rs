@@ -59,7 +59,11 @@ impl CastKernel for Bool {
         }
 
         if let DType::Utf8(_) = dtype {
-            let mut builder = VarBinViewBuilder::with_capacity(dtype.clone(), array.len());
+            let mut builder = VarBinViewBuilder::with_capacity_in(
+                dtype.clone(),
+                array.len(),
+                ctx.allocator().clone(),
+            );
             let bits = array.to_bit_buffer();
             let mask = array.validity()?.execute_mask(array.len(), ctx)?;
 
