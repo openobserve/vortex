@@ -115,7 +115,9 @@ fn calculate_physical_field_type(
     // requested encoding, so an encoded target cannot bypass type checks.
     if let DataType::RunEndEncoded(_, logical_values) = logical_type {
         ensure_no_extension_type(logical_field, "Run-end", &path)?;
-        calculate_physical_field_type(dtype, logical_values, Some(&path), arrow_session)?;
+        let values_type =
+            calculate_physical_field_type(dtype, logical_values, Some(&path), arrow_session)?;
+        ensure_encoded_values_unchanged(dtype, logical_values.data_type(), &values_type)?;
 
         return Ok(logical_type.clone());
     }
@@ -125,7 +127,9 @@ fn calculate_physical_field_type(
         let logical_values = logical_field
             .clone()
             .with_data_type(value_type.as_ref().clone());
-        calculate_physical_field_type(dtype, &logical_values, parent_path, arrow_session)?;
+        let values_type =
+            calculate_physical_field_type(dtype, &logical_values, parent_path, arrow_session)?;
+        ensure_encoded_values_unchanged(dtype, value_type, &values_type)?;
 
         return Ok(logical_type.clone());
     }
@@ -154,6 +158,13 @@ fn calculate_physical_field_type(
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
             if storage_dtype.is_binary() || storage_dtype.is_utf8() {
                 logical_type.clone()
+            } else if storage_dtype.is_int()
+                || storage_dtype.is_float()
+                || storage_dtype.is_boolean()
+            {
+                // Return the file's actual type so the expr adapter can detect
+                // the mismatch and insert the cast.
+                exported_field.data_type().clone()
             } else {
                 return Err(exec_datafusion_err!(
                     "Failed to convert dtype to arrow: Vortex DType is {dtype} which is not compatible with {logical_type}"
@@ -440,6 +451,20 @@ impl fmt::Display for FieldExtensionType<'_> {
     }
 }
 
+/// The encoded type is kept as is, so its values cannot take the file's own type for a later cast.
+fn ensure_encoded_values_unchanged(
+    dtype: &DType,
+    logical_values: &DataType,
+    values_type: &DataType,
+) -> DFResult<()> {
+    if values_type != logical_values {
+        return Err(exec_datafusion_err!(
+            "Failed to convert dtype to arrow: Vortex DType is {dtype} which is not compatible with {logical_values}"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -565,12 +590,17 @@ mod tests {
 
     #[test]
     fn test_failing_conversion_incompatible_types() {
+        // A numeric/bool file column under a Utf8 logical type is a supported evolution
+        // (the expr adapter inserts the cast), so use a dtype with no cast to Utf8 at all.
         let logical_schema = Schema::new(vec![Field::new("col", DataType::Utf8, false)]);
 
         let dtype = DType::Struct(
             StructFields::from_iter([(
                 "col",
-                DType::Primitive(PType::I32, Nullability::NonNullable),
+                DType::List(
+                    Arc::new(DType::Primitive(PType::I32, Nullability::NonNullable)),
+                    Nullability::NonNullable,
+                ),
             )]),
             Nullability::NonNullable,
         );
@@ -604,6 +634,34 @@ mod tests {
                 .to_string()
                 .contains("not compatible with")
         );
+    }
+
+    #[rstest]
+    #[case::int(
+        DType::Primitive(PType::I32, Nullability::NonNullable),
+        DataType::Int32
+    )]
+    #[case::float(
+        DType::Primitive(PType::F64, Nullability::NonNullable),
+        DataType::Float64
+    )]
+    #[case::bool(DType::Bool(Nullability::NonNullable), DataType::Boolean)]
+    fn test_numeric_file_column_under_utf8_logical_type(
+        #[case] dtype: DType,
+        #[case] expected: DataType,
+    ) {
+        // The physical schema keeps the file's own type so the expr adapter can see the
+        // mismatch and insert the cast, rather than erroring out here.
+        let logical_schema = Schema::new(vec![Field::new("col", DataType::Utf8, false)]);
+        let dtype = DType::Struct(
+            StructFields::from_iter([("col", dtype)]),
+            Nullability::NonNullable,
+        );
+
+        let physical_schema =
+            calculate_physical_schema(&dtype, &logical_schema, &VortexSession::empty().arrow())
+                .unwrap();
+        assert_eq!(physical_schema.field(0).data_type(), &expected);
     }
 
     #[test]
