@@ -781,9 +781,29 @@ fn scalar_stat_to_df(
                 .ok()?
                 .try_to_df()
                 .ok()?;
+            // Casts between string and non-string types do not preserve order (9 < 100 but
+            // "100" < "9"), so the cast bounds would prune files that contain matching rows.
+            if is_byte_type(&scalar.data_type()) != is_byte_type(target_dtype) {
+                return None;
+            }
             scalar.cast_to(target_dtype).ok()
         })
         .to_df()
+}
+
+/// Whether values of the type order by their bytes rather than numerically.
+fn is_byte_type(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Dictionary(_, value_type) => is_byte_type(value_type),
+        DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::FixedSizeBinary(_) => true,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -910,6 +930,10 @@ mod tests {
     )]
     #[case::integer_overflow(ScalarValue::Int64(Some(i64::MAX)), DataType::Int32)]
     #[case::unsupported(ScalarValue::Boolean(Some(true)), DataType::Date32)]
+    #[case::integer_to_string(ScalarValue::Int64(Some(100)), DataType::Utf8)]
+    #[case::integer_to_string_view(ScalarValue::Int64(Some(100)), DataType::Utf8View)]
+    #[case::float_to_string(ScalarValue::Float64(Some(1.5)), DataType::Utf8)]
+    #[case::string_to_integer(ScalarValue::Utf8(Some("100".into())), DataType::Int64)]
     fn test_scalar_stat_to_df_failed_cast(
         #[case] value: ScalarValue,
         #[case] target_dtype: DataType,
